@@ -64,7 +64,7 @@ ZONES = [
 
 # ── Output filename ────────────────────────────────────────────────────
 # {profile} is automatically replaced with your LOG_PROFILE value
-OUTPUT_FILENAME = "FalseColor_{profile}.cube"
+OUTPUT_FILENAME = "luts/FalseColor_{profile}.cube"
 
 # ═══════════════════════════════════════════════════════════════════════
 #  END OF CONFIG — No need to edit below this line
@@ -486,6 +486,7 @@ if __name__ == "__main__":
     parsed_zones = build_zones(ZONES, profile, ZONE_HALF_WIDTH_STOPS)
     print_zone_preview(ZONES, parsed_zones, blend_log)
 
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     lut_data = build_lut(parsed_zones, LUT_SIZE, blend_log)
     write_cube(lut_data, LUT_SIZE, filename, profile, ZONES, parsed_zones)
 
