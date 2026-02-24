@@ -14,7 +14,7 @@ Supported profiles:
   bmpfilm5  Blackmagic Film G5 (Pocket 6K G2, 6K Pro...)
 
 Run with:
-  uv run false_color_generator.py
+  uv run false_color_lut_generator.py
 """
 
 import math
@@ -53,13 +53,13 @@ BLEND_WIDTH_STOPS = 0.12       # Softness at zone edges
 # Any HTML hex color works — grab codes from Google Color Picker or coolors.co
 
 ZONES = [
-    ("white_clip",  "#FF0000"),   # Clipping highlights → Red
-    ( 2,            "#FFFF00"),   # +2 Stops            → Yellow
-    ( 1,            "#FF00FF"),   # +1 Stop             → Magenta
-    ( 0,            "#00FF00"),   # Mid Gray (0 stops)  → Lime Green
-    (-1,            "#00FFFF"),   # -1 Stop             → Cyan
-    (-2,            "#0000FF"),   # -2 Stops            → Royal Blue
-    ("black_clip",  "#4B0082"),   # Crushed blacks      → Indigo
+    ("white_clip",  "#ef4444"),   # Clipping highlights → Red (red-500)
+    ( 2,            "#eab308"),   # +2 Stops            → Yellow (yellow-500)
+    ( 1,            "#d946ef"),   # +1 Stop             → Magenta (fuchsia-500)
+    ( 0,            "#22c55e"),   # Mid Gray (0 stops)  → Lime Green (green-500)
+    (-1,            "#06b6d4"),   # -1 Stop             → Cyan (cyan-500)
+    (-2,            "#3b82f6"),   # -2 Stops            → Royal Blue (blue-500)
+    ("black_clip",  "#6366f1"),   # Crushed blacks      → Indigo (indigo-500)
 ]
 
 # ── Output filename ────────────────────────────────────────────────────
