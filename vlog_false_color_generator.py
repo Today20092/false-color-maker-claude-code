@@ -1,110 +1,337 @@
 """
-Panasonic V-Log False Color Exposure LUT Generator
-====================================================
-Edit the CONFIG section below to customize your zones.
-Everything else is automatic.
+False Color Exposure LUT Generator
+====================================
+Supports multiple camera log profiles.
+Edit the CONFIG section — everything else is automatic.
+
+Supported profiles:
+  vlog      Panasonic V-Log L  (GH5, GH6, S5, S5II, BGH1...)
+  slog3     Sony S-Log3        (A7S III, FX3, FX6, A7 IV, ZV-E1...)
+  logc3     ARRI LogC3 EI800   (Alexa Mini, Alexa 35...)
+  clog2     Canon C-Log2       (C70, C300 III, C500 II, EOS R5 C...)
+  flog2     Fuji F-Log2        (X-H2S, X-H2...)
+  nlog      Nikon N-Log        (Z6, Z7, Z6II, Z7II...)  [approximate]
+  bmpfilm5  Blackmagic Film G5 (Pocket 6K G2, 6K Pro...)
+
+Run with:
+  uv run false_color_generator.py
 """
 
-# ═══════════════════════════════════════════════════════════════
-#  CONFIG — Edit this section only
-# ═══════════════════════════════════════════════════════════════
+import math
+import os
 
-# LUT grid size. 33 is standard. 65 is higher quality but larger file.
-LUT_SIZE = 33
 
-# How wide the blend/feather is at each zone edge (in V-Log units).
-# 0.005 = very tight, 0.015 = soft, 0.030 = very wide/dreamy
-BLEND_WIDTH = 0.009
+# ═══════════════════════════════════════════════════════════════════════
+#  CONFIG — Only edit this section
+# ═══════════════════════════════════════════════════════════════════════
 
-# Output filename
-OUTPUT_FILENAME = "VLog_FalseColor_Exposure3.cube"
+# ── Which camera log profile are you grading? ──────────────────────────
+# Options:  vlog | slog3 | logc3 | clog2 | flog2 | nlog | bmpfilm5
+LOG_PROFILE = "vlog"
 
-# Zone definitions — add, remove, or edit rows freely.
-# Format per row:
-#   ( lo,   hi,   "HEX COLOR" )
-#    ↑       ↑         ↑
-#  V-Log  V-Log    HTML hex color code
-#  min    max      (with or without the # symbol)
+# ── LUT settings ───────────────────────────────────────────────────────
+LUT_SIZE = 33          # 33 = standard,  65 = higher quality (4x larger file)
+
+# ── Zone width and feathering ──────────────────────────────────────────
+# Both values are in STOPS — converted to log units automatically per profile.
+ZONE_HALF_WIDTH_STOPS = 0.30   # Width of each color band (±stops from center)
+                                # 0.20 = tight bands,  0.35 = wide bands
+
+BLEND_WIDTH_STOPS = 0.12       # Softness at zone edges
+                                # 0.05 = hard edge,  0.20 = very soft
+
+# ── Zone definitions ───────────────────────────────────────────────────
+# Format:  (stop_value_or_keyword,  "#HEXCOLOR")
 #
-# Anything outside all zones becomes grayscale.
+# stop_value:
+#   A number      →  stops relative to middle gray
+#                    0 = mid gray,  +2 = two stops over,  -1 = one stop under
+#   "white_clip"  →  top of the log curve (clipping highlights)
+#   "black_clip"  →  bottom of the log curve (crushed blacks)
+#
+# Add, remove, or reorder rows freely.
+# Any HTML hex color works — grab codes from Google Color Picker or coolors.co
 
 ZONES = [
-    (0.80, 1.01, "#ef4444"),   # White Clip
-    (0.56, 0.60, "#fde047"),   # +2 Stops
-    (0.48, 0.52, "#d946ef"),   # +1 Stop
-    (0.40, 0.44, "#22c55e"),   # Mid Gray
-    (0.32, 0.36, "#06b6d4"),   # -1 Stop
-    (0.24, 0.28, "#3b82f6"),   # -2 Stops
-    (0.00, 0.10, "#6d28d9"),   # Black Clip
+    ("white_clip",  "#FF0000"),   # Clipping highlights → Red
+    ( 2,            "#FFFF00"),   # +2 Stops            → Yellow
+    ( 1,            "#FF00FF"),   # +1 Stop             → Magenta
+    ( 0,            "#00FF00"),   # Mid Gray (0 stops)  → Lime Green
+    (-1,            "#00FFFF"),   # -1 Stop             → Cyan
+    (-2,            "#0000FF"),   # -2 Stops            → Royal Blue
+    ("black_clip",  "#4B0082"),   # Crushed blacks      → Indigo
 ]
 
-# ═══════════════════════════════════════════════════════════════
+# ── Output filename ────────────────────────────────────────────────────
+# {profile} is automatically replaced with your LOG_PROFILE value
+OUTPUT_FILENAME = "FalseColor_{profile}.cube"
+
+# ═══════════════════════════════════════════════════════════════════════
 #  END OF CONFIG — No need to edit below this line
-# ═══════════════════════════════════════════════════════════════
-
-import numpy as np
+# ═══════════════════════════════════════════════════════════════════════
 
 
-# ── Hex → normalized RGB (0.0–1.0) ──────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  LOG PROFILE TRANSFER FUNCTIONS
+#
+#  Each function converts scene-linear light (0.0–1.0, where 0.18 = 18%
+#  gray) to the log-encoded value (0.0–1.0) used in that camera profile.
+#
+#  Sources:
+#    V-Log    — Panasonic V-Log/V-Log L Spec v1.0
+#    S-Log3   — Sony S-Log3 Technical Summary v1.0
+#    LogC3    — ARRI LogC3 Specification (Alexa v3 color science)
+#    C-Log2   — Canon Log Gamma Curve Spec v2.0
+#    F-Log2   — Fujifilm F-Log2 Specification v1.0
+#    N-Log    — Nikon N-Log Specification (APPROXIMATE — see note)
+#    BMDFilm5 — Blackmagic Design Generation 5 Color Science SDK
+# ───────────────────────────────────────────────────────────────────────
+
+def _vlog_to_log(x):
+    """Panasonic V-Log L. Covers ~14 stops dynamic range."""
+    x = max(x, 1e-10)
+    if x < 0.01:
+        return 5.6 * x + 0.125
+    return 0.241514 * math.log10(x + 0.00873) + 0.598206
+
+
+def _slog3_to_log(x):
+    """Sony S-Log3. Covers ~15.3 stops dynamic range."""
+    x = max(x, 1e-10)
+    if x >= 0.014:
+        return (420.0 + math.log10((x + 0.01) / 0.20) * 261.5) / 1023.0
+    return (x * (171.2102946929 - 95.0) / 0.01 + 95.0) / 1023.0
+
+
+def _logc3_to_log(x):
+    """ARRI LogC3 at EI800. Covers ~14 stops dynamic range."""
+    x = max(x, 1e-10)
+    if x >= 0.010591:
+        return 0.247190 * math.log10(5.555556 * x + 0.052272) + 0.385537
+    return 5.367655 * x + 0.092809
+
+
+def _clog2_to_log(x):
+    """Canon C-Log2. Covers ~15+ stops dynamic range."""
+    x = max(x, 1e-10)
+    return 0.281863093 * math.log10(87.09937546 * x + 1.0) + 0.073059361
+
+
+def _flog2_to_log(x):
+    """
+    Fuji F-Log2. Covers ~14+ stops dynamic range.
+    Reference: Fujifilm F-Log2 Specification v1.0
+    """
+    x = max(x, 1e-10)
+    cut = 0.000889544
+    if x >= cut:
+        return 0.384736 * math.log10(x + 0.064829) + 0.553667
+    return 8.799461 * x + 0.092864
+
+
+def _nlog_to_log(x):
+    """
+    Nikon N-Log. Covers ~12 stops dynamic range.
+    NOTE: This is an approximation derived from published middle-gray and
+    white-point references. Verify against Nikon's official LUT tools
+    before using in color-critical work.
+    """
+    x = max(x, 1e-10)
+    cut = 0.006
+    if x >= cut:
+        return 0.4614 * math.log10(12.8 * x + 1.0) + 0.124
+    return 10.541 * x + 0.124
+
+
+def _bmpfilm5_to_log(x):
+    """
+    Blackmagic Film Gen 5. Covers ~13 stops dynamic range.
+    Reference: Blackmagic Design Generation 5 Color Science SDK.
+    """
+    x = max(x, 1e-10)
+    cut = 0.005
+    if x < cut:
+        return 8.283605932402494 * x + 0.09246575342465753
+    return 0.08692876065491224 * math.log(x + 0.005494072432257808) + 0.5402385771788551
+
+
+# ── Profile registry ────────────────────────────────────────────────────
+# To add a new profile: copy one of the blocks below, give it a key,
+# fill in the linear_to_log function and reference values.
+
+PROFILES = {
+    "vlog": {
+        "name":          "Panasonic V-Log L",
+        "cameras":       "GH5, GH6, S5, S5II, S1, BGH1, AU-EVA1",
+        "linear_to_log": _vlog_to_log,
+        "middle_gray":   0.4233,  # log-encoded value of 18% gray
+        "white_clip":    (0.80, 1.01),
+        "black_clip":    (0.00, 0.10),
+    },
+    "slog3": {
+        "name":          "Sony S-Log3",
+        "cameras":       "A7S III, A7 IV, FX3, FX6, FX9, ZV-E1, Venice",
+        "linear_to_log": _slog3_to_log,
+        "middle_gray":   0.4049,
+        "white_clip":    (0.76, 1.00),
+        "black_clip":    (0.00, 0.09),
+    },
+    "logc3": {
+        "name":          "ARRI LogC3 (EI800)",
+        "cameras":       "Alexa Mini, Alexa Mini LF, Alexa 35, Amira",
+        "linear_to_log": _logc3_to_log,
+        "middle_gray":   0.3910,
+        "white_clip":    (0.75, 1.00),
+        "black_clip":    (0.00, 0.09),
+    },
+    "clog2": {
+        "name":          "Canon C-Log2",
+        "cameras":       "C70, C300 III, C500 II, EOS R5 C, EOS C70",
+        "linear_to_log": _clog2_to_log,
+        "middle_gray":   0.4175,
+        "white_clip":    (0.70, 1.00),
+        "black_clip":    (0.00, 0.07),
+    },
+    "flog2": {
+        "name":          "Fuji F-Log2",
+        "cameras":       "X-H2S, X-H2, GFX100S II",
+        "linear_to_log": _flog2_to_log,
+        "middle_gray":   0.3185,
+        "white_clip":    (0.60, 1.00),
+        "black_clip":    (0.00, 0.09),
+    },
+    "nlog": {
+        "name":          "Nikon N-Log  [approximate]",
+        "cameras":       "Z6, Z7, Z6II, Z7II, Z8, Z9",
+        "linear_to_log": _nlog_to_log,
+        "middle_gray":   0.3635,
+        "white_clip":    (0.72, 1.00),
+        "black_clip":    (0.00, 0.08),
+    },
+    "bmpfilm5": {
+        "name":          "Blackmagic Film Gen 5",
+        "cameras":       "Pocket 6K G2, 6K Pro, 6K G2, URSA Mini Pro 12K",
+        "linear_to_log": _bmpfilm5_to_log,
+        "middle_gray":   0.3938,
+        "white_clip":    (0.75, 1.00),
+        "black_clip":    (0.00, 0.09),
+    },
+}
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  STOP → LOG CONVERSION
+#  Because each log profile compresses stops differently, we use the
+#  profile's own transfer function to calculate exact log-domain zone
+#  boundaries. This means ±1 stop is always exactly ±1 stop of real
+#  light, regardless of which profile you're using.
+# ───────────────────────────────────────────────────────────────────────
+
+MIDDLE_GRAY_LINEAR = 0.18  # Scene-linear value of 18% gray (industry standard)
+
+def stop_to_log(stops, profile):
+    """
+    Convert a stop offset (relative to middle gray) to a log-encoded value.
+    Each stop doubles or halves the linear light level:
+      +1 stop = 0.18 * 2^1 = 0.36 linear
+      -2 stops = 0.18 * 2^-2 = 0.045 linear
+    """
+    linear = MIDDLE_GRAY_LINEAR * (2.0 ** stops)
+    return profile["linear_to_log"](linear)
+
+
+def stop_to_log_range(stops, half_width_stops, profile):
+    """
+    Return (lo, hi) log boundaries for a zone centered at 'stops',
+    spanning ±half_width_stops on either side.
+    """
+    lo = stop_to_log(stops - half_width_stops, profile)
+    hi = stop_to_log(stops + half_width_stops, profile)
+    return lo, hi
+
+
+def blend_width_in_log(blend_width_stops, profile):
+    """
+    Convert a stop-based blend width to log units by measuring
+    how wide one stop is in log space at middle gray.
+    """
+    center       = stop_to_log(0, profile)
+    one_stop_up  = stop_to_log(blend_width_stops, profile)
+    return abs(one_stop_up - center)
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  ZONE BUILDER
+# ───────────────────────────────────────────────────────────────────────
+
 def hex_to_rgb(hex_color):
-    """Convert a hex color string like '#FF0000' or 'FF0000' to (r, g, b) floats."""
+    """Convert '#FF0000' or 'FF0000' to normalized (r, g, b) floats 0.0–1.0."""
     hex_color = hex_color.strip().lstrip("#")
     if len(hex_color) != 6:
-        raise ValueError(f"Invalid hex color: '#{hex_color}' — must be 6 digits e.g. #FF0000")
-    r = int(hex_color[0:2], 16) / 255.0
-    g = int(hex_color[2:4], 16) / 255.0
-    b = int(hex_color[4:6], 16) / 255.0
-    return r, g, b
+        raise ValueError(
+            f"Invalid hex color '#{hex_color}' — must be 6 digits, e.g. #FF0000"
+        )
+    return (
+        int(hex_color[0:2], 16) / 255.0,
+        int(hex_color[2:4], 16) / 255.0,
+        int(hex_color[4:6], 16) / 255.0,
+    )
 
 
-# ── Build parsed zones from config ──────────────────────────────
-def build_parsed_zones(zones):
+def build_zones(zones_config, profile, half_width_stops):
     """
-    Convert the human-friendly ZONES list into a list of
-    (lo, hi, r, g, b) tuples ready for the LUT math.
+    Resolve each entry in the user's ZONES list into a
+    (lo, hi, r, g, b) tuple with log-domain boundaries.
     """
     parsed = []
-    for i, entry in enumerate(zones):
-        if len(entry) != 3:
-            raise ValueError(f"Zone {i+1} must have exactly 3 values: (lo, hi, hex_color)")
-        lo, hi, hex_color = entry
+    for stop_val, hex_color in zones_config:
         r, g, b = hex_to_rgb(hex_color)
+
+        if stop_val == "white_clip":
+            lo, hi = profile["white_clip"]
+        elif stop_val == "black_clip":
+            lo, hi = profile["black_clip"]
+        elif isinstance(stop_val, (int, float)):
+            lo, hi = stop_to_log_range(stop_val, half_width_stops, profile)
+        else:
+            raise ValueError(
+                f"Unknown zone value '{stop_val}' — "
+                f"use a number, 'white_clip', or 'black_clip'"
+            )
+
         parsed.append((lo, hi, r, g, b))
+
     return parsed
 
 
-# ── V-Log luma extraction ────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  CORE FALSE COLOR MATH
+# ───────────────────────────────────────────────────────────────────────
+
 def rgb_luminance(r, g, b):
     """
-    Combine R, G, B into a single perceptual brightness value.
-    Uses Rec.709 luma weights — green contributes most because
-    human eyes are most sensitive to green light.
+    Rec.709 perceptual luma. Combines R, G, B into a single brightness.
+    Green is weighted most because human eyes are most sensitive to it.
     """
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-# ── Smoothstep blend curve ───────────────────────────────────────
 def smoothstep(edge0, edge1, x):
-    """
-    Returns a smooth 0→1 value as x moves from edge0 to edge1.
-    Uses an S-curve so transitions ease in and out naturally.
-    """
+    """S-curve interpolation: 0.0 at edge0, 1.0 at edge1, smooth in between."""
     t = max(0.0, min(1.0, (x - edge0) / (edge1 - edge0)))
     return t * t * (3.0 - 2.0 * t)
 
 
-# ── Core false color logic ───────────────────────────────────────
 def apply_false_color(r, g, b, parsed_zones, blend_width):
     """
-    Given V-Log R,G,B values (0–1):
+    Given log-encoded R,G,B (0.0–1.0):
     - Calculate luma
-    - Find which zone it belongs to (with soft edges)
-    - Return blended false color, or grayscale if outside all zones
+    - Find the zone with the strongest match (with smooth edges)
+    - Return the blended false color, or grayscale if outside all zones
     """
-    luma = rgb_luminance(r, g, b)
-
-    best_color = None
+    luma        = rgb_luminance(r, g, b)
     best_weight = 0.0
+    best_color  = None
 
     for (lo, hi, fr, fg, fb) in parsed_zones:
         fade_in  = smoothstep(lo - blend_width, lo + blend_width, luma)
@@ -116,33 +343,33 @@ def apply_false_color(r, g, b, parsed_zones, blend_width):
             best_color  = (fr, fg, fb)
 
     if best_color is None or best_weight == 0.0:
-        return luma, luma, luma   # grayscale passthrough
+        return luma, luma, luma  # grayscale passthrough
 
     fr, fg, fb = best_color
-    r_out = fr * best_weight + luma * (1.0 - best_weight)
-    g_out = fg * best_weight + luma * (1.0 - best_weight)
-    b_out = fb * best_weight + luma * (1.0 - best_weight)
-    return r_out, g_out, b_out
+    return (
+        fr * best_weight + luma * (1.0 - best_weight),
+        fg * best_weight + luma * (1.0 - best_weight),
+        fb * best_weight + luma * (1.0 - best_weight),
+    )
 
 
-# ── Build the full 3D LUT table ──────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  LUT BUILDER AND WRITER
+# ───────────────────────────────────────────────────────────────────────
+
 def build_lut(parsed_zones, size, blend_width):
-    lut   = []
-    step  = 1.0 / (size - 1)
-
-    print(f"Building {size}³ LUT ({size**3:,} entries)...")
+    """Build the full size³ LUT table."""
+    lut  = []
+    step = 1.0 / (size - 1)
+    print(f"  Building {size}³ LUT ({size**3:,} entries)...")
 
     for bi in range(size):
         for gi in range(size):
             for ri in range(size):
-                r_in = ri * step
-                g_in = gi * step
-                b_in = bi * step
-
                 r_out, g_out, b_out = apply_false_color(
-                    r_in, g_in, b_in, parsed_zones, blend_width
+                    ri * step, gi * step, bi * step,
+                    parsed_zones, blend_width
                 )
-
                 lut.append((
                     max(0.0, min(1.0, r_out)),
                     max(0.0, min(1.0, g_out)),
@@ -153,26 +380,33 @@ def build_lut(parsed_zones, size, blend_width):
     return lut
 
 
-# ── Write .cube file ─────────────────────────────────────────────
-def write_cube(lut, size, filename, zones):
-    zone_comments = "\n".join(
-        f"#   {hex_col:<10}  {lo:.2f} - {hi:.2f}"
-        for (lo, hi, hex_col) in zones
+def write_cube(lut, size, filename, profile, zones_config, parsed_zones):
+    """Write the LUT table to a .cube file with a descriptive header."""
+    zone_lines = []
+    for (stop_val, hex_col), (lo, hi, *_) in zip(zones_config, parsed_zones):
+        label = (
+            "white_clip" if stop_val == "white_clip" else
+            "black_clip" if stop_val == "black_clip" else
+            f"{stop_val:+.0f} stops"
+        )
+        zone_lines.append(f"#   {hex_col:<10}  {label:<14}  log {lo:.3f} - {hi:.3f}")
+
+    header = (
+        f"# False Color Exposure Monitor LUT\n"
+        f"# Profile  : {profile['name']}\n"
+        f"# Cameras  : {profile['cameras']}\n"
+        f"# Generator: false_color_generator.py\n"
+        f"#\n"
+        f"# Zone Reference:\n"
+        + "\n".join(zone_lines) +
+        f"\n#   Grayscale   = between zones / untagged\n"
+        f"#\n"
+        f"TITLE \"FalseColor {profile['name']}\"\n"
+        f"LUT_3D_SIZE {size}\n"
+        f"DOMAIN_MIN 0.0 0.0 0.0\n"
+        f"DOMAIN_MAX 1.0 1.0 1.0\n\n"
     )
 
-    header = f"""# Panasonic V-Log False Color Exposure Monitor LUT
-# Generated by vlog_false_color_generator.py
-#
-# Zones:
-{zone_comments}
-#   Grayscale   = between zones
-#
-TITLE "VLog FalseColor Exposure Monitor"
-LUT_3D_SIZE {size}
-DOMAIN_MIN 0.0 0.0 0.0
-DOMAIN_MAX 1.0 1.0 1.0
-
-"""
     with open(filename, "w") as f:
         f.write(header)
         for (r, g, b) in lut:
@@ -181,58 +415,82 @@ DOMAIN_MAX 1.0 1.0 1.0
     print(f"  ✓ Written to: {filename}")
 
 
-# ── Zone preview printout ────────────────────────────────────────
-def print_zone_preview(parsed_zones, blend_width):
-    print("\n-- Zone Preview -----------------------------------------------")
-    print(f"  {'V-Log':>6}  {'Input Label':<30}  Output Hex   RGB")
-    print(f"  {'------':>6}  {'------------------------------':<30}  ----------  ------------------")
+# ───────────────────────────────────────────────────────────────────────
+#  ZONE PREVIEW PRINTOUT
+# ───────────────────────────────────────────────────────────────────────
 
-    test_points = []
-    for (lo, hi, fr, fg, fb) in parsed_zones:
-        center = (lo + hi) / 2.0
-        hex_in = "#{:02X}{:02X}{:02X}".format(
-            int(fr * 255), int(fg * 255), int(fb * 255)
+def print_zone_preview(zones_config, parsed_zones, blend_width):
+    print(f"\n  {'Zone':<16} {'Log Range':<18} {'Target':<10} {'Output':<10} Match")
+    print(f"  {'────':<16} {'─────────':<18} {'──────':<10} {'──────':<10} ─────")
+
+    for (stop_val, hex_col), (lo, hi, fr, fg, fb) in zip(zones_config, parsed_zones):
+        label = (
+            "white_clip" if stop_val == "white_clip" else
+            "black_clip" if stop_val == "black_clip" else
+            f"{stop_val:+.0f} stops"
         )
-        test_points.append((center, f"Zone center  (target {hex_in})"))
-
-    for i in range(len(parsed_zones) - 1):
-        hi_current = parsed_zones[i][1]
-        lo_next    = parsed_zones[i + 1][0]
-        mid        = (hi_current + lo_next) / 2.0
-        test_points.append((mid, "Between zones (expect gray)"))
-
-    test_points.sort(key=lambda x: x[0], reverse=True)
-
-    for val, label in test_points:
-        r_out, g_out, b_out = apply_false_color(val, val, val, parsed_zones, blend_width)
+        center = (lo + hi) / 2.0
+        r_out, g_out, b_out = apply_false_color(
+            center, center, center, parsed_zones, blend_width
+        )
         hex_out = "#{:02X}{:02X}{:02X}".format(
             int(r_out * 255), int(g_out * 255), int(b_out * 255)
         )
-        print(f"  {val:>6.3f}  {label:<30}  {hex_out}    ({r_out:.2f}, {g_out:.2f}, {b_out:.2f})")
+        match = "✓" if hex_out.upper() == hex_col.upper() else "~"
+        print(f"  {label:<16} {lo:.3f} - {hi:.3f}    {hex_col:<10} {hex_out:<10} {match}")
+
+    # Sample a between-zone point (should always be gray)
+    if len(parsed_zones) >= 2:
+        gap_mid = (parsed_zones[0][1] + parsed_zones[1][0]) / 2.0
+        r_out, g_out, b_out = apply_false_color(
+            gap_mid, gap_mid, gap_mid, parsed_zones, blend_width
+        )
+        hex_out = "#{:02X}{:02X}{:02X}".format(
+            int(r_out * 255), int(g_out * 255), int(b_out * 255)
+        )
+        print(f"  {'(between zones)':<16} {gap_mid:.3f}              {'(gray)':<10} {hex_out:<10} –")
+
     print()
 
 
-# ── Main ─────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  MAIN
+# ───────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    import os
 
-    print("=" * 57)
-    print("  V-Log False Color Exposure LUT Generator")
-    print("=" * 57)
-    print(f"\n  Zones defined : {len(ZONES)}")
-    print(f"  LUT size      : {LUT_SIZE}^3 ({LUT_SIZE**3:,} entries)")
-    print(f"  Blend width   : {BLEND_WIDTH}")
-    print(f"  Output file   : {OUTPUT_FILENAME}")
+    # Validate profile
+    if LOG_PROFILE not in PROFILES:
+        available = "  |  ".join(PROFILES.keys())
+        raise ValueError(
+            f"\nUnknown profile '{LOG_PROFILE}'.\n"
+            f"Available options:  {available}\n"
+        )
 
-    parsed_zones = build_parsed_zones(ZONES)
+    profile    = PROFILES[LOG_PROFILE]
+    filename   = OUTPUT_FILENAME.replace("{profile}", LOG_PROFILE)
+    blend_log  = blend_width_in_log(BLEND_WIDTH_STOPS, profile)
 
-    print_zone_preview(parsed_zones, BLEND_WIDTH)
+    print("=" * 58)
+    print("  False Color Exposure LUT Generator")
+    print("=" * 58)
+    print(f"\n  Profile       : {profile['name']}")
+    print(f"  Cameras       : {profile['cameras']}")
+    print(f"  Middle gray   : {profile['middle_gray']:.4f}  (log-encoded 18% gray)")
+    print(f"  Zones defined : {len(ZONES)}")
+    print(f"  Zone width    : ±{ZONE_HALF_WIDTH_STOPS} stops")
+    print(f"  Blend width   : {BLEND_WIDTH_STOPS} stops  ({blend_log:.4f} log units)")
+    print(f"  LUT size      : {LUT_SIZE}³  ({LUT_SIZE**3:,} entries)")
+    print(f"  Output file   : {filename}")
 
-    lut_data = build_lut(parsed_zones, LUT_SIZE, BLEND_WIDTH)
-    write_cube(lut_data, LUT_SIZE, OUTPUT_FILENAME, ZONES)
+    parsed_zones = build_zones(ZONES, profile, ZONE_HALF_WIDTH_STOPS)
+    print_zone_preview(ZONES, parsed_zones, blend_log)
 
-    size_kb = os.path.getsize(OUTPUT_FILENAME) / 1024
-    print(f"\n Done!  File size: {size_kb:.1f} KB")
-    print(f"   Drop '{OUTPUT_FILENAME}' into DaVinci Resolve,")
-    print(f"   Premiere Pro, or your Lumix camera's LUT slot.")
-    print("=" * 57)
+    lut_data = build_lut(parsed_zones, LUT_SIZE, blend_log)
+    write_cube(lut_data, LUT_SIZE, filename, profile, ZONES, parsed_zones)
+
+    size_kb = os.path.getsize(filename) / 1024
+    print(f"\n✅ Done!  {size_kb:.1f} KB")
+    print(f"   Drop '{filename}' into DaVinci Resolve,")
+    print(f"   Premiere Pro, FCPX, or your camera's LUT slot.")
+    print("=" * 58)
