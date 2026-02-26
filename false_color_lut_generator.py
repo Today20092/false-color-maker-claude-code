@@ -44,14 +44,23 @@ LUT_SIZE = 33          # 33 = standard,  65 = higher quality (4x larger file)
 #
 #   Rule of thumb: keep the ratio at or below ⅓  (blend < half_width / 3)
 
-ZONE_HALF_WIDTH_STOPS = 0.30   # Half-width of each color band (±stops from center)
-                                # 0.20 = tight / precise  |  0.35 = wide / forgiving
-                                # Adjacent zones are 1 stop apart, so half_width=0.50
-                                # would make them touch with no gray gap between them.
+ZONE_HALF_WIDTH_STOPS = 0.15   # Half-width of each color band (±stops from center)
+                                #
+                                # This controls how much of the tonal range is colored vs gray.
+                                # Zones are spaced 1 stop apart, so the math is straightforward:
+                                #
+                                #   half_width   total zone width   gray gap between zones   % of range colored*
+                                #   0.10         0.20 stops         0.80 stops               ~27%
+                                #   0.15         0.30 stops         0.70 stops               ~33%  ← default
+                                #   0.20         0.40 stops         0.60 stops               ~39%
+                                #   0.30         0.60 stops         0.40 stops               ~51%  (too wide — mostly colored)
+                                #   0.50         1.00 stops         0.00 stops               ~100% (zones touch, no gray at all)
+                                #
+                                #   * sampled uniformly across the full legal signal range
 
-BLEND_WIDTH_STOPS = 0.08       # Feathering at zone edges (in stops)
-                                # 0.05 = hard edge  |  0.15 = very soft
-                                # Ratio with default half_width: 0.08/0.30 = 27%  ✓
+BLEND_WIDTH_STOPS = 0.04       # Feathering at zone edges (in stops)
+                                # 0.03 = hard edge  |  0.10 = very soft
+                                # Ratio with default half_width: 0.04/0.15 = 27%  ✓
 
 # ── Zone definitions ───────────────────────────────────────────────────
 # Format:  (stop_value_or_keyword,  "#HEXCOLOR")
