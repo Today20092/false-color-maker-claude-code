@@ -37,7 +37,7 @@ LUT_SIZE = 33          # 33 = standard,  65 = higher quality (4x larger file)
 ZONE_HALF_WIDTH_STOPS = 0.30   # Width of each color band (±stops from center)
                                 # 0.20 = tight bands,  0.35 = wide bands
 
-BLEND_WIDTH_STOPS = 0.12       # Softness at zone edges
+BLEND_WIDTH_STOPS = 0.08       # Softness at zone edges
                                 # 0.05 = hard edge,  0.20 = very soft
 
 # ── Zone definitions ───────────────────────────────────────────────────
