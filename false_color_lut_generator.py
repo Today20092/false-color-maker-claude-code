@@ -34,11 +34,24 @@ LUT_SIZE = 33          # 33 = standard,  65 = higher quality (4x larger file)
 
 # ── Zone width and feathering ──────────────────────────────────────────
 # Both values are in STOPS — converted to log units automatically per profile.
-ZONE_HALF_WIDTH_STOPS = 0.30   # Width of each color band (±stops from center)
-                                # 0.20 = tight bands,  0.35 = wide bands
+#
+# KEY CONSTRAINT:  BLEND_WIDTH_STOPS / ZONE_HALF_WIDTH_STOPS  (the "blend ratio")
+#
+#   > 50%  Zone cores never reach full saturation — everything looks washed/mixed
+#   ~ 40%  Cores reach solid color but blending eats most of the zone (too soft)
+#   25–30% Sweet spot: solid core with a clean, smooth edge  ← aim for this
+#   < 15%  Very hard edges; clinical/precise but can look harsh
+#
+#   Rule of thumb: keep the ratio at or below ⅓  (blend < half_width / 3)
 
-BLEND_WIDTH_STOPS = 0.12       # Softness at zone edges
-                                # 0.05 = hard edge,  0.20 = very soft
+ZONE_HALF_WIDTH_STOPS = 0.30   # Half-width of each color band (±stops from center)
+                                # 0.20 = tight / precise  |  0.35 = wide / forgiving
+                                # Adjacent zones are 1 stop apart, so half_width=0.50
+                                # would make them touch with no gray gap between them.
+
+BLEND_WIDTH_STOPS = 0.08       # Feathering at zone edges (in stops)
+                                # 0.05 = hard edge  |  0.15 = very soft
+                                # Ratio with default half_width: 0.08/0.30 = 27%  ✓
 
 # ── Zone definitions ───────────────────────────────────────────────────
 # Format:  (stop_value_or_keyword,  "#HEXCOLOR")
@@ -487,6 +500,41 @@ if __name__ == "__main__":
     print(f"  Blend width   : {BLEND_WIDTH_STOPS} stops  ({blend_log:.4f} log units)")
     print(f"  LUT size      : {LUT_SIZE}³  ({LUT_SIZE**3:,} entries)")
     print(f"  Output file   : {filename}")
+
+    # ── Blend ratio check ────────────────────────────────────────────────
+    # The blend ramp is applied symmetrically at each zone edge, so the
+    # ramp from each side eats into the zone core from both directions.
+    # When blend/half_width > ~0.33, the two ramps overlap in the middle
+    # and the zone core never reaches 100% opacity.
+    #
+    # Concretely: a zone spans  [center - half_width, center + half_width].
+    # The color is fully solid only between:
+    #   (center - half_width + blend_width)  and  (center + half_width - blend_width)
+    # That solid core is  2 * (half_width - blend_width)  stops wide.
+    # If blend_width >= half_width the core shrinks to zero — no solid color at all.
+    blend_ratio     = BLEND_WIDTH_STOPS / ZONE_HALF_WIDTH_STOPS
+    solid_core_stops = 2.0 * (ZONE_HALF_WIDTH_STOPS - BLEND_WIDTH_STOPS)
+
+    if blend_ratio > 0.50:
+        ratio_label = "⚠️  POOR   — zones never reach solid color (cores overlap)"
+    elif blend_ratio > 0.40:
+        ratio_label = "⚠️  SOFT   — cores barely solid, blending dominates"
+    elif blend_ratio > 0.33:
+        ratio_label = "〜  OK     — usable but softer than ideal"
+    elif blend_ratio >= 0.15:
+        ratio_label = "✓  GOOD   — solid core with smooth edges"
+    else:
+        ratio_label = "〜  SHARP  — hard edges, clinical look"
+
+    print(f"\n  Blend ratio   : {blend_ratio:.0%}  ({ratio_label})")
+    print(f"  Solid core    : {solid_core_stops:.3f} stops per zone"
+          f"  (zone is {ZONE_HALF_WIDTH_STOPS*2:.2f} stops wide,"
+          f" {blend_ratio*100:.0f}% consumed by fade ramps)")
+    if blend_ratio > 0.40:
+        print(f"\n  ⚠  Consider reducing BLEND_WIDTH_STOPS to"
+              f" {ZONE_HALF_WIDTH_STOPS * 0.27:.2f}"
+              f" (27% of half_width = solid-core sweet spot)")
+    # ─────────────────────────────────────────────────────────────────────
 
     parsed_zones = build_zones(ZONES, profile, ZONE_HALF_WIDTH_STOPS)
     print_zone_preview(ZONES, parsed_zones, blend_log)
