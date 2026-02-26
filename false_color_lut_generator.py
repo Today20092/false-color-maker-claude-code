@@ -96,11 +96,16 @@ def _vlog_to_log(x):
 
 
 def _slog3_to_log(x):
-    """Sony S-Log3. Covers ~15.3 stops dynamic range."""
+    """Sony S-Log3. Covers ~15.3 stops dynamic range.
+    Reference: Sony S-Log3 Technical Summary v1.0
+    Legal range: 0% exposure = 95/1023 ≈ 0.0929, middle gray = 420/1023 ≈ 0.4106
+    Denominator is (0.18 + 0.01) = 0.19 per Sony spec. Cutpoint 0.01125 ensures
+    continuity between the linear and logarithmic segments.
+    """
     x = max(x, 1e-10)
-    if x >= 0.014:
-        return (420.0 + math.log10((x + 0.01) / 0.20) * 261.5) / 1023.0
-    return (x * (171.2102946929 - 95.0) / 0.01 + 95.0) / 1023.0
+    if x >= 0.01125:
+        return (420.0 + math.log10((x + 0.01) / 0.19) * 261.5) / 1023.0
+    return (x * (171.2102946929 - 95.0) / 0.01125 + 95.0) / 1023.0
 
 
 def _logc3_to_log(x):
@@ -166,15 +171,15 @@ PROFILES = {
         "linear_to_log": _vlog_to_log,
         "middle_gray":   0.4233,  # log-encoded value of 18% gray
         "white_clip":    (0.80, 1.01),
-        "black_clip":    (0.00, 0.10),
+        "black_clip":    (0.00, 0.13),  # covers nominal black at 128/1024 = 0.125 (legal range)
     },
     "slog3": {
         "name":          "Sony S-Log3",
         "cameras":       "A7S III, A7 IV, FX3, FX6, FX9, ZV-E1, Venice",
         "linear_to_log": _slog3_to_log,
-        "middle_gray":   0.4049,
+        "middle_gray":   0.4106,  # 420/1023 per Sony S-Log3 spec (legal range)
         "white_clip":    (0.76, 1.00),
-        "black_clip":    (0.00, 0.09),
+        "black_clip":    (0.00, 0.10),  # covers nominal black at 95/1023 ≈ 0.0929
     },
     "logc3": {
         "name":          "ARRI LogC3 (EI800)",
@@ -182,7 +187,7 @@ PROFILES = {
         "linear_to_log": _logc3_to_log,
         "middle_gray":   0.3910,
         "white_clip":    (0.75, 1.00),
-        "black_clip":    (0.00, 0.09),
+        "black_clip":    (0.00, 0.10),  # covers nominal black at ~0.0928
     },
     "clog2": {
         "name":          "Canon C-Log2",
@@ -190,7 +195,7 @@ PROFILES = {
         "linear_to_log": _clog2_to_log,
         "middle_gray":   0.4175,
         "white_clip":    (0.70, 1.00),
-        "black_clip":    (0.00, 0.07),
+        "black_clip":    (0.00, 0.08),  # covers nominal black at ~0.0731
     },
     "flog2": {
         "name":          "Fuji F-Log2",
@@ -198,7 +203,7 @@ PROFILES = {
         "linear_to_log": _flog2_to_log,
         "middle_gray":   0.3185,
         "white_clip":    (0.60, 1.00),
-        "black_clip":    (0.00, 0.09),
+        "black_clip":    (0.00, 0.10),  # covers nominal black at ~0.0929
     },
     "nlog": {
         "name":          "Nikon N-Log  [approximate]",
@@ -206,7 +211,7 @@ PROFILES = {
         "linear_to_log": _nlog_to_log,
         "middle_gray":   0.3635,
         "white_clip":    (0.72, 1.00),
-        "black_clip":    (0.00, 0.08),
+        "black_clip":    (0.00, 0.13),  # covers nominal black at ~0.124 (legal range)
     },
     "bmpfilm5": {
         "name":          "Blackmagic Film Gen 5",
@@ -214,7 +219,7 @@ PROFILES = {
         "linear_to_log": _bmpfilm5_to_log,
         "middle_gray":   0.3938,
         "white_clip":    (0.75, 1.00),
-        "black_clip":    (0.00, 0.09),
+        "black_clip":    (0.00, 0.10),  # covers nominal black at ~0.0925
     },
 }
 
