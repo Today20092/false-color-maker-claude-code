@@ -10,19 +10,32 @@ Supported profiles:
   logc3     ARRI LogC3 EI800   (Alexa Mini, Alexa 35...)
   clog2     Canon C-Log2       (C70, C300 III, C500 II, EOS R5 C...)
   flog2     Fuji F-Log2        (X-H2S, X-H2...)
-  nlog      Nikon N-Log        (Z6, Z7, Z6II, Z7II...)  [approximate]
+  nlog      Nikon N-Log        (Z6, Z7, Z6II, Z7II...)
   bmpfilm5  Blackmagic Film G5 (Pocket 6K G2, 6K Pro...)
 
 Run with:
   uv run false_color_lut_generator.py
   uv run false_color_lut_generator.py --profile slog3 --size 65
+
+Dependencies:
+  colour-science  — vendor-accurate log transfer functions (https://www.colour-science.org/)
+  numpy           — vectorised LUT generation
+  pillow          — gradient preview PNG
+  typer           — modern CLI with auto-complete and pretty --help
+  rich            — coloured terminal output
 """
 
-import math
 import os
+from typing import Annotated, Optional
 
+import colour
 import numpy as np
-
+import typer
+from PIL import Image
+from rich import box
+from rich.console import Console
+from rich.rule import Rule
+from rich.table import Table
 
 # ═══════════════════════════════════════════════════════════════════════
 #  CONFIG — Only edit this section
@@ -33,7 +46,7 @@ import numpy as np
 LOG_PROFILE = "vlog"
 
 # ── LUT settings ───────────────────────────────────────────────────────
-LUT_SIZE = 33          # 33 = standard,  65 = higher quality (4x larger file)
+LUT_SIZE = 33  # 33 = standard,  65 = higher quality (4x larger file)
 
 # ── Zone width and feathering ──────────────────────────────────────────
 # Both values are in STOPS — converted to log units automatically per profile.
@@ -47,23 +60,23 @@ LUT_SIZE = 33          # 33 = standard,  65 = higher quality (4x larger file)
 #
 #   Rule of thumb: keep the ratio at or below ⅓  (blend < half_width / 3)
 
-ZONE_HALF_WIDTH_STOPS = 0.15   # Half-width of each color band (±stops from center)
-                                #
-                                # This controls how much of the tonal range is colored vs gray.
-                                # Zones are spaced 1 stop apart, so the math is straightforward:
-                                #
-                                #   half_width   total zone width   gray gap between zones   % of range colored*
-                                #   0.10         0.20 stops         0.80 stops               ~27%
-                                #   0.15         0.30 stops         0.70 stops               ~33%  ← default
-                                #   0.20         0.40 stops         0.60 stops               ~39%
-                                #   0.30         0.60 stops         0.40 stops               ~51%  (too wide — mostly colored)
-                                #   0.50         1.00 stops         0.00 stops               ~100% (zones touch, no gray at all)
-                                #
-                                #   * sampled uniformly across the full legal signal range
+ZONE_HALF_WIDTH_STOPS = 0.15  # Half-width of each color band (±stops from center)
+#
+# This controls how much of the tonal range is colored vs gray.
+# Zones are spaced 1 stop apart, so the math is straightforward:
+#
+#   half_width   total zone width   gray gap between zones   % of range colored*
+#   0.10         0.20 stops         0.80 stops               ~27%
+#   0.15         0.30 stops         0.70 stops               ~33%  ← default
+#   0.20         0.40 stops         0.60 stops               ~39%
+#   0.30         0.60 stops         0.40 stops               ~51%  (too wide — mostly colored)
+#   0.50         1.00 stops         0.00 stops               ~100% (zones touch, no gray at all)
+#
+#   * sampled uniformly across the full legal signal range
 
-BLEND_WIDTH_STOPS = 0.04       # Feathering at zone edges (in stops)
-                                # 0.03 = hard edge  |  0.10 = very soft
-                                # Ratio with default half_width: 0.04/0.15 = 27%  ✓
+BLEND_WIDTH_STOPS = 0.04  # Feathering at zone edges (in stops)
+# 0.03 = hard edge  |  0.10 = very soft
+# Ratio with default half_width: 0.04/0.15 = 27%  ✓
 
 # ── Zone definitions ───────────────────────────────────────────────────
 # Format:  (stop_value_or_keyword,  "#HEXCOLOR")
@@ -78,13 +91,13 @@ BLEND_WIDTH_STOPS = 0.04       # Feathering at zone edges (in stops)
 # Any HTML hex color works — grab codes from Google Color Picker or coolors.co
 
 ZONES = [
-    ("white_clip",  "#ef4444"),   # Clipping highlights → Red (red-500)
-    ( 2,            "#eab308"),   # +2 Stops            → Yellow (yellow-500)
-    ( 1,            "#d946ef"),   # +1 Stop             → Magenta (fuchsia-500)
-    ( 0,            "#22c55e"),   # Mid Gray (0 stops)  → Lime Green (green-500)
-    (-1,            "#06b6d4"),   # -1 Stop             → Cyan (cyan-500)
-    (-2,            "#3b82f6"),   # -2 Stops            → Royal Blue (blue-500)
-    ("black_clip",  "#6366f1"),   # Crushed blacks      → Indigo (indigo-500)
+    ("white_clip", "#ef4444"),  # Clipping highlights → Red (red-500)
+    (2, "#eab308"),  # +2 Stops            → Yellow (yellow-500)
+    (1, "#d946ef"),  # +1 Stop             → Magenta (fuchsia-500)
+    (0, "#22c55e"),  # Mid Gray (0 stops)  → Lime Green (green-500)
+    (-1, "#06b6d4"),  # -1 Stop             → Cyan (cyan-500)
+    (-2, "#3b82f6"),  # -2 Stops            → Royal Blue (blue-500)
+    ("black_clip", "#6366f1"),  # Crushed blacks      → Indigo (indigo-500)
 ]
 
 # ── Output filename ────────────────────────────────────────────────────
@@ -96,183 +109,98 @@ OUTPUT_FILENAME = "luts/FalseColor_{profile}.cube"
 # ═══════════════════════════════════════════════════════════════════════
 
 
+console = Console()
+
+
 # ───────────────────────────────────────────────────────────────────────
-#  LOG PROFILE TRANSFER FUNCTIONS
+#  LOG PROFILE REGISTRY
 #
-#  Each function converts scene-linear light (0.0–1.0, where 0.18 = 18%
-#  gray) to the log-encoded value (0.0–1.0) used in that camera profile.
+#  Transfer functions are provided by colour-science
+#  (https://www.colour-science.org/), which implements the published
+#  vendor specifications for each log format.
 #
-#  Sources:
-#    V-Log    — Panasonic V-Log/V-Log L Spec v1.0
-#    S-Log3   — Sony S-Log3 Technical Summary v1.0
-#    LogC3    — ARRI LogC3 Specification (Alexa v3 color science)
-#    C-Log2   — Canon Log Gamma Curve Spec v2.0
-#    F-Log2   — Fujifilm F-Log2 Specification v1.0
-#    N-Log    — Nikon N-Log Specification (APPROXIMATE — see note)
-#    BMDFilm5 — Blackmagic Design Generation 5 Color Science SDK
+#  linear_to_log : scene-linear (0.18 = 18% gray) → log-encoded (0.0–1.0)
+#  log_to_linear : log-encoded (0.0–1.0) → scene-linear (exact inverse)
+#
+#  middle_gray   : reference log-encoded value of 18% gray (display only)
+#  white_clip    : (lo, hi) log-encoded bounds for highlight clipping zone
+#  black_clip    : (lo, hi) log-encoded bounds for shadow clipping zone
 # ───────────────────────────────────────────────────────────────────────
 
-def _vlog_to_log(x: float) -> float:
-    """Panasonic V-Log L. Covers ~14 stops dynamic range."""
-    x = max(x, 1e-10)
-    if x < 0.01:
-        return 5.6 * x + 0.125
-    return 0.241514 * math.log10(x + 0.00873) + 0.598206
+
+def _logc3_encode(x):
+    """ARRI LogC3 encode at EI800 — wrapper to lock in the exposure index."""
+    return colour.models.log_encoding_LogC3(x, exposure_index=800)
 
 
-def _slog3_to_log(x: float) -> float:
-    """Sony S-Log3. Covers ~15.3 stops dynamic range.
-    Reference: Sony S-Log3 Technical Summary v1.0
-    Legal range: 0% exposure = 95/1023 ≈ 0.0929, middle gray = 420/1023 ≈ 0.4106
-    Denominator is (0.18 + 0.01) = 0.19 per Sony spec. Cutpoint 0.01125 ensures
-    continuity between the linear and logarithmic segments.
-    """
-    x = max(x, 1e-10)
-    if x >= 0.01125:
-        return (420.0 + math.log10((x + 0.01) / 0.19) * 261.5) / 1023.0
-    return (x * (171.2102946929 - 95.0) / 0.01125 + 95.0) / 1023.0
+def _logc3_decode(x):
+    """ARRI LogC3 decode at EI800 — wrapper to lock in the exposure index."""
+    return colour.models.log_decoding_LogC3(x, exposure_index=800)
 
-
-def _logc3_to_log(x: float) -> float:
-    """ARRI LogC3 at EI800. Covers ~14 stops dynamic range."""
-    x = max(x, 1e-10)
-    if x >= 0.010591:
-        return 0.247190 * math.log10(5.555556 * x + 0.052272) + 0.385537
-    return 5.367655 * x + 0.092809
-
-
-def _clog2_to_log(x: float) -> float:
-    """Canon C-Log2. Covers ~15+ stops dynamic range."""
-    x = max(x, 1e-10)
-    return 0.281863093 * math.log10(87.09937546 * x + 1.0) + 0.073059361
-
-
-def _flog2_to_log(x: float) -> float:
-    """
-    Fuji F-Log2. Covers ~14+ stops dynamic range.
-    Reference: Fujifilm F-Log2 Specification v1.0
-    """
-    x = max(x, 1e-10)
-    cut = 0.000889544
-    if x >= cut:
-        return 0.384736 * math.log10(x + 0.064829) + 0.553667
-    return 8.799461 * x + 0.092864
-
-
-def _nlog_to_log(x: float) -> float:
-    """
-    Nikon N-Log. Covers ~12 stops dynamic range.
-    NOTE: This is an approximation derived from published middle-gray and
-    white-point references. Verify against Nikon's official LUT tools
-    before using in color-critical work.
-    """
-    x = max(x, 1e-10)
-    cut = 0.006
-    if x >= cut:
-        return 0.4614 * math.log10(12.8 * x + 1.0) + 0.124
-    return 10.541 * x + 0.124
-
-
-def _bmpfilm5_to_log(x: float) -> float:
-    """
-    Blackmagic Film Gen 5. Covers ~13 stops dynamic range.
-    Reference: Blackmagic Design Generation 5 Color Science SDK.
-    """
-    x = max(x, 1e-10)
-    cut = 0.005
-    if x < cut:
-        return 8.283605932402494 * x + 0.09246575342465753
-    return 0.08692876065491224 * math.log(x + 0.005494072432257808) + 0.5402385771788551
-
-
-# ── Transfer function self-tests ─────────────────────────────────────────
-# Verify that each profile's middle gray (0.18 linear) maps to its published
-# reference log value. Any mismatch > 0.002 log units raises an error at import.
-
-def _validate_transfer_functions() -> None:
-    """Sanity-check each profile's transfer function against published reference points."""
-    tol = 0.002
-    checks = [
-        ("V-Log L",        _vlog_to_log,     0.18, 0.4233),
-        ("S-Log3",         _slog3_to_log,    0.18, 0.4106),
-        ("LogC3 EI800",    _logc3_to_log,    0.18, 0.3910),
-        ("C-Log2",         _clog2_to_log,    0.18, 0.4175),
-        ("F-Log2",         _flog2_to_log,    0.18, 0.3185),
-        ("N-Log [approx]", _nlog_to_log,     0.18, 0.3635),
-        ("BMD Film Gen 5", _bmpfilm5_to_log, 0.18, 0.3938),
-    ]
-    for name, fn, linear_in, expected in checks:
-        actual = fn(linear_in)
-        if abs(actual - expected) > tol:
-            raise AssertionError(
-                f"Transfer function mismatch for {name}: "
-                f"expected {expected:.4f}, got {actual:.4f} "
-                f"(diff {abs(actual - expected):.4f} > tol {tol})"
-            )
-
-_validate_transfer_functions()
-
-
-# ── Profile registry ────────────────────────────────────────────────────
-# To add a new profile: copy one of the blocks below, give it a key,
-# fill in the linear_to_log function and reference values.
 
 PROFILES = {
     "vlog": {
-        "name":          "Panasonic V-Log L",
-        "cameras":       "GH5, GH6, S5, S5II, S1, BGH1, AU-EVA1",
-        "linear_to_log": _vlog_to_log,
-        "middle_gray":   0.4233,  # log-encoded value of 18% gray
-        "white_clip":    (0.80, 1.01),
-        "black_clip":    (0.00, 0.13),  # covers nominal black at 128/1024 = 0.125 (legal range)
+        "name": "Panasonic V-Log L",
+        "cameras": "GH5, GH6, S5, S5II, S1, BGH1, AU-EVA1",
+        "linear_to_log": colour.models.log_encoding_VLog,
+        "log_to_linear": colour.models.log_decoding_VLog,
+        "middle_gray": 0.4233,  # log-encoded value of 18% gray (V-Log L spec)
+        "white_clip": (0.80, 1.01),
+        "black_clip": (0.00, 0.13),  # nominal black at 128/1024 = 0.125
     },
     "slog3": {
-        "name":          "Sony S-Log3",
-        "cameras":       "A7S III, A7 IV, FX3, FX6, FX9, ZV-E1, Venice",
-        "linear_to_log": _slog3_to_log,
-        "middle_gray":   0.4106,  # 420/1023 per Sony S-Log3 spec (legal range)
-        "white_clip":    (0.76, 1.00),
-        "black_clip":    (0.00, 0.10),  # covers nominal black at 95/1023 ≈ 0.0929
+        "name": "Sony S-Log3",
+        "cameras": "A7S III, A7 IV, FX3, FX6, FX9, ZV-E1, Venice",
+        "linear_to_log": colour.models.log_encoding_SLog3,
+        "log_to_linear": colour.models.log_decoding_SLog3,
+        "middle_gray": 0.4106,  # 420/1023 per Sony S-Log3 spec
+        "white_clip": (0.76, 1.00),
+        "black_clip": (0.00, 0.10),  # nominal black at 95/1023 ≈ 0.0929
     },
     "logc3": {
-        "name":          "ARRI LogC3 (EI800)",
-        "cameras":       "Alexa Mini, Alexa Mini LF, Alexa 35, Amira",
-        "linear_to_log": _logc3_to_log,
-        "middle_gray":   0.3910,
-        "white_clip":    (0.75, 1.00),
-        "black_clip":    (0.00, 0.10),  # covers nominal black at ~0.0928
+        "name": "ARRI LogC3 (EI800)",
+        "cameras": "Alexa Mini, Alexa Mini LF, Alexa 35, Amira",
+        "linear_to_log": _logc3_encode,
+        "log_to_linear": _logc3_decode,
+        "middle_gray": 0.3910,
+        "white_clip": (0.75, 1.00),
+        "black_clip": (0.00, 0.10),  # nominal black at ~0.0928
     },
     "clog2": {
-        "name":          "Canon C-Log2",
-        "cameras":       "C70, C300 III, C500 II, EOS R5 C, EOS C70",
-        "linear_to_log": _clog2_to_log,
-        "middle_gray":   0.4175,
-        "white_clip":    (0.70, 1.00),
-        "black_clip":    (0.00, 0.08),  # covers nominal black at ~0.0731
+        "name": "Canon C-Log2",
+        "cameras": "C70, C300 III, C500 II, EOS R5 C, EOS C70",
+        "linear_to_log": colour.models.log_encoding_CanonLog2,
+        "log_to_linear": colour.models.log_decoding_CanonLog2,
+        "middle_gray": 0.4175,
+        "white_clip": (0.70, 1.00),
+        "black_clip": (0.00, 0.08),  # nominal black at ~0.0731
     },
     "flog2": {
-        "name":          "Fuji F-Log2",
-        "cameras":       "X-H2S, X-H2, GFX100S II",
-        "linear_to_log": _flog2_to_log,
-        "middle_gray":   0.3185,
-        "white_clip":    (0.60, 1.00),
-        "black_clip":    (0.00, 0.10),  # covers nominal black at ~0.0929
+        "name": "Fuji F-Log2",
+        "cameras": "X-H2S, X-H2, GFX100S II",
+        "linear_to_log": colour.models.log_encoding_FLog2,
+        "log_to_linear": colour.models.log_decoding_FLog2,
+        "middle_gray": 0.3185,
+        "white_clip": (0.60, 1.00),
+        "black_clip": (0.00, 0.10),  # nominal black at ~0.0929
     },
     "nlog": {
-        "name":          "Nikon N-Log  [approximate]",
-        "cameras":       "Z6, Z7, Z6II, Z7II, Z8, Z9",
-        "linear_to_log": _nlog_to_log,
-        "middle_gray":   0.3635,
-        "white_clip":    (0.72, 1.00),
-        "black_clip":    (0.00, 0.13),  # covers nominal black at ~0.124 (legal range)
+        "name": "Nikon N-Log",
+        "cameras": "Z6, Z7, Z6II, Z7II, Z8, Z9",
+        "linear_to_log": colour.models.log_encoding_NLog,
+        "log_to_linear": colour.models.log_decoding_NLog,
+        "middle_gray": 0.3635,
+        "white_clip": (0.72, 1.00),
+        "black_clip": (0.00, 0.13),  # nominal black at ~0.124
     },
     "bmpfilm5": {
-        "name":          "Blackmagic Film Gen 5",
-        "cameras":       "Pocket 6K G2, 6K Pro, 6K G2, URSA Mini Pro 12K",
-        "linear_to_log": _bmpfilm5_to_log,
-        "middle_gray":   0.3938,
-        "white_clip":    (0.75, 1.00),
-        "black_clip":    (0.00, 0.10),  # covers nominal black at ~0.0925
+        "name": "Blackmagic Film Gen 5",
+        "cameras": "Pocket 6K G2, 6K Pro, 6K G2, URSA Mini Pro 12K",
+        "linear_to_log": colour.models.oetf_BlackmagicFilmGeneration5,
+        "log_to_linear": colour.models.oetf_inverse_BlackmagicFilmGeneration5,
+        "middle_gray": 0.3938,
+        "white_clip": (0.75, 1.00),
+        "black_clip": (0.00, 0.10),  # nominal black at ~0.0925
     },
 }
 
@@ -287,6 +215,7 @@ PROFILES = {
 
 MIDDLE_GRAY_LINEAR = 0.18  # Scene-linear value of 18% gray (industry standard)
 
+
 def stop_to_log(stops: float, profile: dict) -> float:
     """
     Convert a stop offset (relative to middle gray) to a log-encoded value.
@@ -294,11 +223,13 @@ def stop_to_log(stops: float, profile: dict) -> float:
       +1 stop = 0.18 * 2^1 = 0.36 linear
       -2 stops = 0.18 * 2^-2 = 0.045 linear
     """
-    linear = MIDDLE_GRAY_LINEAR * (2.0 ** stops)
-    return profile["linear_to_log"](linear)
+    linear = max(MIDDLE_GRAY_LINEAR * (2.0**stops), 1e-10)
+    return float(profile["linear_to_log"](linear))
 
 
-def stop_to_log_range(stops: float, half_width_stops: float, profile: dict) -> tuple[float, float]:
+def stop_to_log_range(
+    stops: float, half_width_stops: float, profile: dict
+) -> tuple[float, float]:
     """
     Return (lo, hi) log boundaries for a zone centered at 'stops',
     spanning ±half_width_stops on either side.
@@ -314,7 +245,7 @@ def blend_width_in_log(blend_width_stops: float, profile: dict) -> float:
     Used for informational display only; per-zone blend widths are
     computed more accurately in build_zones().
     """
-    center      = stop_to_log(0, profile)
+    center = stop_to_log(0, profile)
     one_stop_up = stop_to_log(blend_width_stops, profile)
     return abs(one_stop_up - center)
 
@@ -322,6 +253,7 @@ def blend_width_in_log(blend_width_stops: float, profile: dict) -> float:
 # ───────────────────────────────────────────────────────────────────────
 #  ZONE BUILDER
 # ───────────────────────────────────────────────────────────────────────
+
 
 def hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
     """Convert '#FF0000' or 'FF0000' to normalized (r, g, b) floats 0.0–1.0."""
@@ -372,12 +304,11 @@ def build_zones(
             )
 
         # Compute blend width in log units at this zone's center stop.
-        # For clip zones, fall back to middle gray as an approximation.
         if center_stop is not None:
-            c  = stop_to_log(center_stop, profile)
+            c = stop_to_log(center_stop, profile)
             up = stop_to_log(center_stop + blend_width_stops, profile)
         else:
-            c  = stop_to_log(0, profile)
+            c = stop_to_log(0, profile)
             up = stop_to_log(blend_width_stops, profile)
         bw = abs(up - c)
 
@@ -391,11 +322,11 @@ def check_zone_overlaps(parsed_zones: list) -> None:
     sorted_z = sorted(parsed_zones, key=lambda z: z[0])
     for i in range(len(sorted_z) - 1):
         lo_a, hi_a = sorted_z[i][0], sorted_z[i][1]
-        lo_b, hi_b = sorted_z[i + 1][0], sorted_z[i + 1][1]
+        lo_b = sorted_z[i + 1][0]
         if hi_a > lo_b:
-            print(
-                f"  ⚠  Zone overlap: log {lo_a:.3f}–{hi_a:.3f} "
-                f"overlaps log {lo_b:.3f}–{hi_b:.3f} "
+            console.print(
+                f"  [yellow]⚠[/yellow]  Zone overlap: log {lo_a:.3f}–{hi_a:.3f} "
+                f"overlaps log {lo_b:.3f}–{hi_a:.3f} "
                 f"(shared range {lo_b:.3f}–{hi_a:.3f})"
             )
 
@@ -403,13 +334,6 @@ def check_zone_overlaps(parsed_zones: list) -> None:
 # ───────────────────────────────────────────────────────────────────────
 #  CORE FALSE COLOR MATH
 # ───────────────────────────────────────────────────────────────────────
-
-def rgb_luminance(r: float, g: float, b: float) -> float:
-    """
-    Rec.709 perceptual luma. Combines R, G, B into a single brightness.
-    Green is weighted most because human eyes are most sensitive to it.
-    """
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
 def smoothstep(edge0: float, edge1: float, x: float) -> float:
@@ -421,26 +345,46 @@ def smoothstep(edge0: float, edge1: float, x: float) -> float:
 
 
 def apply_false_color(
-    r: float, g: float, b: float, parsed_zones: list
+    r: float, g: float, b: float, parsed_zones: list, profile: dict
 ) -> tuple[float, float, float]:
     """
     Given log-encoded R,G,B (0.0–1.0):
-    - Calculate luma
-    - Find the zone with the strongest match (with smooth edges)
-    - Return the blended false color, or grayscale if outside all zones
-    """
-    luma        = rgb_luminance(r, g, b)
-    best_weight = 0.0
-    best_color  = None
 
-    for (lo, hi, fr, fg, fb, bw) in parsed_zones:
-        fade_in  = smoothstep(lo - bw, lo + bw, luma)
+    1. Decode each channel to scene-linear light via the profile's EOTF
+    2. Compute Rec.709 luma (Y') in the *linear* domain — physically accurate
+       because log curves compress stops non-uniformly, especially in shadows
+    3. Re-encode that linear luma back to log for zone threshold comparisons
+    4. Find the zone with the strongest match (with smooth edges)
+    5. Return the blended false color, or grayscale if outside all zones
+
+    Computing luma on linear light ensures one "stop" of exposure always
+    spans the same fraction of the tonal scale, from deep shadows to highlights.
+    """
+    log_to_linear = profile["log_to_linear"]
+    linear_to_log = profile["linear_to_log"]
+
+    # Step 1 — decode log → linear per channel
+    r_lin = float(log_to_linear(r))
+    g_lin = float(log_to_linear(g))
+    b_lin = float(log_to_linear(b))
+
+    # Step 2 — Rec.709 luma in linear light
+    luma_linear = 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
+
+    # Step 3 — re-encode luma to log for zone comparisons
+    luma = float(linear_to_log(max(luma_linear, 1e-10)))
+
+    best_weight = 0.0
+    best_color = None
+
+    for lo, hi, fr, fg, fb, bw in parsed_zones:
+        fade_in = smoothstep(lo - bw, lo + bw, luma)
         fade_out = 1.0 - smoothstep(hi - bw, hi + bw, luma)
-        weight   = fade_in * fade_out
+        weight = fade_in * fade_out
 
         if weight > best_weight:
             best_weight = weight
-            best_color  = (fr, fg, fb)
+            best_color = (fr, fg, fb)
 
     if best_color is None or best_weight == 0.0:
         return luma, luma, luma  # grayscale passthrough
@@ -457,24 +401,46 @@ def apply_false_color(
 #  LUT BUILDER AND WRITER
 # ───────────────────────────────────────────────────────────────────────
 
-def build_lut(parsed_zones: list, size: int) -> list[tuple[float, float, float]]:
+
+def build_lut(
+    parsed_zones: list, size: int, profile: dict
+) -> list[tuple[float, float, float]]:
     """
     Build the full size³ LUT table using NumPy vectorization.
 
-    Computes luminance and smoothstep blending across the entire 3D grid
-    simultaneously, which is ~10–100× faster than a pure-Python loop.
+    Luma is computed in the correct physical order:
+      1. Decode log R/G/B → linear light  (colour-science transfer functions)
+      2. Apply Rec.709 luma coefficients to linear values
+      3. Re-encode linear luma → log for zone threshold comparisons
+
+    This ensures one stop of exposure spans the same log-space fraction
+    regardless of where it falls on the tonal scale (unlike applying
+    Rec.709 coefficients directly to the log-encoded signal).
 
     Output order matches the .cube format: B (outer) → G → R (inner).
     """
-    print(f"  Building {size}³ LUT ({size**3:,} entries)...")
+    console.print(
+        f"  Building [dim]{size}³[/dim] LUT [dim]({size**3:,} entries)[/dim]..."
+    )
 
     vals = np.linspace(0.0, 1.0, size)
 
     # Shape: (size, size, size) indexed as [ri, gi, bi]
     R, G, B = np.meshgrid(vals, vals, vals, indexing="ij")
 
-    # Rec.709 luminance over the full grid
-    luma = 0.2126 * R + 0.7152 * G + 0.0722 * B
+    log_to_linear = profile["log_to_linear"]
+    linear_to_log = profile["linear_to_log"]
+
+    # Step 1 — decode log → linear (colour-science handles numpy arrays natively)
+    R_lin = np.asarray(log_to_linear(R), dtype=np.float64)
+    G_lin = np.asarray(log_to_linear(G), dtype=np.float64)
+    B_lin = np.asarray(log_to_linear(B), dtype=np.float64)
+
+    # Step 2 — Rec.709 luma in linear light
+    luma_linear = 0.2126 * R_lin + 0.7152 * G_lin + 0.0722 * B_lin
+
+    # Step 3 — re-encode luma to log for zone matching
+    luma = np.asarray(linear_to_log(np.maximum(luma_linear, 1e-10)), dtype=np.float64)
 
     # Start with grayscale passthrough; overwrite where zones match
     out_r = luma.copy()
@@ -482,27 +448,27 @@ def build_lut(parsed_zones: list, size: int) -> list[tuple[float, float, float]]
     out_b = luma.copy()
     best_weight = np.zeros_like(luma)
 
-    for (lo, hi, fr, fg, fb, bw) in parsed_zones:
+    for lo, hi, fr, fg, fb, bw in parsed_zones:
         if bw == 0.0:
-            fade_in  = np.where(luma >= lo, 1.0, 0.0)
-            fade_out = np.where(luma <  hi, 1.0, 0.0)
+            fade_in = np.where(luma >= lo, 1.0, 0.0)
+            fade_out = np.where(luma < hi, 1.0, 0.0)
         else:
-            t_in    = np.clip((luma - (lo - bw)) / (2.0 * bw), 0.0, 1.0)
+            t_in = np.clip((luma - (lo - bw)) / (2.0 * bw), 0.0, 1.0)
             fade_in = t_in * t_in * (3.0 - 2.0 * t_in)
-            t_out    = np.clip((luma - (hi - bw)) / (2.0 * bw), 0.0, 1.0)
+            t_out = np.clip((luma - (hi - bw)) / (2.0 * bw), 0.0, 1.0)
             fade_out = 1.0 - t_out * t_out * (3.0 - 2.0 * t_out)
 
-        weight  = fade_in * fade_out
-        mask    = weight > best_weight
+        weight = fade_in * fade_out
+        mask = weight > best_weight
 
         mixed_r = fr * weight + luma * (1.0 - weight)
         mixed_g = fg * weight + luma * (1.0 - weight)
         mixed_b = fb * weight + luma * (1.0 - weight)
 
         best_weight = np.where(mask, weight, best_weight)
-        out_r       = np.where(mask, mixed_r, out_r)
-        out_g       = np.where(mask, mixed_g, out_g)
-        out_b       = np.where(mask, mixed_b, out_b)
+        out_r = np.where(mask, mixed_r, out_r)
+        out_g = np.where(mask, mixed_g, out_g)
+        out_b = np.where(mask, mixed_b, out_b)
 
     out_r = np.clip(out_r, 0.0, 1.0)
     out_g = np.clip(out_g, 0.0, 1.0)
@@ -515,7 +481,7 @@ def build_lut(parsed_zones: list, size: int) -> list[tuple[float, float, float]]
     flat_b = out_b.transpose(2, 1, 0).ravel()
 
     lut = list(zip(flat_r.tolist(), flat_g.tolist(), flat_b.tolist()))
-    print(f"  ✓ {len(lut):,} entries generated.")
+    console.print(f"  [green]✓[/green] {len(lut):,} entries generated.")
     return lut
 
 
@@ -531,9 +497,11 @@ def write_cube(
     zone_lines = []
     for (stop_val, hex_col), (lo, hi, *_) in zip(zones_config, parsed_zones):
         label = (
-            "white_clip" if stop_val == "white_clip" else
-            "black_clip" if stop_val == "black_clip" else
-            f"{stop_val:+.0f} stops"
+            "white_clip"
+            if stop_val == "white_clip"
+            else "black_clip"
+            if stop_val == "black_clip"
+            else f"{stop_val:+.0f} stops"
         )
         zone_lines.append(f"#   {hex_col:<10}  {label:<14}  log {lo:.3f} - {hi:.3f}")
 
@@ -544,10 +512,10 @@ def write_cube(
         f"# Generator: false_color_lut_generator.py\n"
         f"#\n"
         f"# Zone Reference:\n"
-        + "\n".join(zone_lines) +
-        f"\n#   Grayscale   = between zones / untagged\n"
+        + "\n".join(zone_lines)
+        + f"\n#   Grayscale   = between zones / untagged\n"
         f"#\n"
-        f"TITLE \"FalseColor {profile['name']}\"\n"
+        f'TITLE "FalseColor {profile["name"]}"\n'
         f"LUT_3D_SIZE {size}\n"
         f"DOMAIN_MIN 0.0 0.0 0.0\n"
         f"DOMAIN_MAX 1.0 1.0 1.0\n\n"
@@ -555,162 +523,296 @@ def write_cube(
 
     with open(filename, "w") as f:
         f.write(header)
-        for (r, g, b) in lut:
+        for r, g, b in lut:
             f.write(f"{r:.6f} {g:.6f} {b:.6f}\n")
 
-    print(f"  ✓ Written to: {filename}")
+    console.print(f"  [green]✓[/green] Written to: [bold]{filename}[/bold]")
 
 
 # ───────────────────────────────────────────────────────────────────────
-#  ZONE PREVIEW PRINTOUT
+#  GRADIENT PREVIEW IMAGE  (Pillow)
 # ───────────────────────────────────────────────────────────────────────
 
-def print_zone_preview(zones_config: list, parsed_zones: list) -> None:
-    print(f"\n  {'Zone':<16} {'Log Range':<18} {'Target':<10} {'Output':<10} Match")
-    print(f"  {'────':<16} {'─────────':<18} {'──────':<10} {'──────':<10} ─────")
 
-    for (stop_val, hex_col), (lo, hi, fr, fg, fb, bw) in zip(zones_config, parsed_zones):
+def generate_gradient_preview(
+    parsed_zones: list,
+    profile: dict,
+    output_path: str,
+    width: int = 1920,
+    height: int = 200,
+) -> None:
+    """
+    Render a horizontal gradient (log 0→1) with false color applied and
+    save it as a PNG alongside the .cube file.
+
+    The image gives an instant visual reference of the zone layout —
+    which tonal ranges are colored, and what colors they map to —
+    without needing to open Resolve or Premiere.
+
+    For a neutral gray ramp (R=G=B), the linear luma equals the decoded
+    linear value, so re-encoding gives back the original log value.
+    The false color zones appear exactly where configured.
+    """
+    t = np.linspace(0.0, 1.0, width)
+
+    # Apply false color to each column of the gradient
+    row = np.zeros((width, 3), dtype=np.uint8)
+    for i, v in enumerate(t):
+        r_out, g_out, b_out = apply_false_color(
+            float(v), float(v), float(v), parsed_zones, profile
+        )
+        row[i] = [
+            int(max(0.0, min(1.0, r_out)) * 255),
+            int(max(0.0, min(1.0, g_out)) * 255),
+            int(max(0.0, min(1.0, b_out)) * 255),
+        ]
+
+    img_array = np.tile(row, (height, 1, 1))
+    Image.fromarray(img_array, mode="RGB").save(output_path)
+    console.print(f"  [green]✓[/green] Preview saved: [bold]{output_path}[/bold]")
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  ZONE PREVIEW TABLE  (Rich)
+# ───────────────────────────────────────────────────────────────────────
+
+
+def _swatch(hex_col: str) -> str:
+    """
+    Rich markup for a color swatch: colored background block with the hex code.
+    Text color (black/white) is chosen automatically for contrast.
+    """
+    r = int(hex_col[1:3], 16) / 255.0
+    g = int(hex_col[3:5], 16) / 255.0
+    b = int(hex_col[5:7], 16) / 255.0
+    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    fg = "black" if luma > 0.45 else "white"
+    return f"[{fg} on {hex_col}] {hex_col} [/]"
+
+
+def print_zone_table(zones_config: list, parsed_zones: list, profile: dict) -> None:
+    """Print a Rich table showing each zone with live terminal color swatches."""
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold dim",
+        border_style="dim",
+        padding=(0, 1),
+    )
+    table.add_column("Zone", style="bold", min_width=16)
+    table.add_column("Log Range", style="dim", min_width=15)
+    table.add_column("Target", justify="center", min_width=14)
+    table.add_column("Output", justify="center", min_width=14)
+    table.add_column("Match", justify="center", min_width=5)
+
+    for (stop_val, hex_col), (lo, hi, fr, fg, fb, bw) in zip(
+        zones_config, parsed_zones
+    ):
         label = (
-            "white_clip" if stop_val == "white_clip" else
-            "black_clip" if stop_val == "black_clip" else
-            f"{stop_val:+.0f} stops"
+            "white_clip"
+            if stop_val == "white_clip"
+            else "black_clip"
+            if stop_val == "black_clip"
+            else f"{stop_val:+.0f} stops"
         )
         center = (lo + hi) / 2.0
-        r_out, g_out, b_out = apply_false_color(center, center, center, parsed_zones)
+        r_out, g_out, b_out = apply_false_color(
+            center, center, center, parsed_zones, profile
+        )
         hex_out = "#{:02X}{:02X}{:02X}".format(
             int(r_out * 255), int(g_out * 255), int(b_out * 255)
         )
-        match = "✓" if hex_out.upper() == hex_col.upper() else "~"
-        print(f"  {label:<16} {lo:.3f} - {hi:.3f}    {hex_col:<10} {hex_out:<10} {match}")
+        match = (
+            "[green]✓[/green]"
+            if hex_out.upper() == hex_col.upper()
+            else "[yellow]~[/yellow]"
+        )
+        table.add_row(
+            label, f"{lo:.3f} – {hi:.3f}", _swatch(hex_col), _swatch(hex_out), match
+        )
 
-    # Sample a between-zone point (should always be gray).
-    # Sort by lo so the gap midpoint is always between the two lowest zones,
-    # regardless of the order zones were defined in CONFIG.
+    # Verify a between-zone point (should be gray)
     if len(parsed_zones) >= 2:
         sorted_z = sorted(parsed_zones, key=lambda z: z[0])
-        gap_mid  = (sorted_z[0][1] + sorted_z[1][0]) / 2.0
-        r_out, g_out, b_out = apply_false_color(gap_mid, gap_mid, gap_mid, parsed_zones)
+        gap_mid = (sorted_z[0][1] + sorted_z[1][0]) / 2.0
+        r_out, g_out, b_out = apply_false_color(
+            gap_mid, gap_mid, gap_mid, parsed_zones, profile
+        )
         hex_out = "#{:02X}{:02X}{:02X}".format(
             int(r_out * 255), int(g_out * 255), int(b_out * 255)
         )
-        print(f"  {'(between zones)':<16} {gap_mid:.3f}              {'(gray)':<10} {hex_out:<10} –")
+        table.add_row(
+            "[dim](between zones)[/dim]",
+            f"[dim]{gap_mid:.3f}[/dim]",
+            "[dim](gray)[/dim]",
+            _swatch(hex_out),
+            "–",
+        )
 
-    print()
+    console.print(table)
 
 
 # ───────────────────────────────────────────────────────────────────────
-#  MAIN
+#  CLI  (Typer)
 # ───────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    """Entry point for the False Color LUT generator."""
-    import argparse
+app = typer.Typer(
+    add_completion=False,
+    rich_markup_mode="rich",
+    help="Generate a false color exposure LUT for a camera log profile.",
+)
 
-    parser = argparse.ArgumentParser(
-        description="Generate a false color exposure LUT for a camera log profile.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--profile", default=LOG_PROFILE, choices=list(PROFILES.keys()),
-        help="Camera log profile",
-    )
-    parser.add_argument(
-        "--size", type=int, default=LUT_SIZE, metavar="N",
-        help="LUT grid size (standard NLE values: 17, 33, 65)",
-    )
-    parser.add_argument(
-        "--half-width", type=float, default=ZONE_HALF_WIDTH_STOPS, metavar="STOPS",
-        help="Zone half-width in stops (±stops from zone center)",
-    )
-    parser.add_argument(
-        "--blend", type=float, default=BLEND_WIDTH_STOPS, metavar="STOPS",
-        help="Feathering width at zone edges in stops",
-    )
-    parser.add_argument(
-        "--output", default=None, metavar="FILE",
-        help="Output .cube filename (default: luts/FalseColor_{profile}.cube)",
-    )
-    args = parser.parse_args()
 
-    log_profile       = args.profile
-    lut_size          = args.size
-    zone_half_width   = args.half_width
-    blend_width_stops = args.blend
-    filename          = (args.output or OUTPUT_FILENAME).replace("{profile}", log_profile)
+@app.command()
+def main(
+    profile: Annotated[
+        str,
+        typer.Option(
+            help=f"Camera log profile. Options: {', '.join(PROFILES.keys())}",
+            show_default=True,
+        ),
+    ] = LOG_PROFILE,
+    size: Annotated[
+        int,
+        typer.Option(
+            metavar="N",
+            help="LUT grid size. Standard NLE values: 17, 33, 65.",
+        ),
+    ] = LUT_SIZE,
+    half_width: Annotated[
+        float,
+        typer.Option(
+            "--half-width",
+            metavar="STOPS",
+            help="Zone half-width in stops (±stops from zone center).",
+        ),
+    ] = ZONE_HALF_WIDTH_STOPS,
+    blend: Annotated[
+        float,
+        typer.Option(
+            metavar="STOPS",
+            help="Feathering width at zone edges in stops.",
+        ),
+    ] = BLEND_WIDTH_STOPS,
+    output: Annotated[
+        Optional[str],
+        typer.Option(
+            metavar="FILE",
+            help="Output .cube filename. Default: luts/FalseColor_{profile}.cube",
+        ),
+    ] = None,
+    preview: Annotated[
+        bool,
+        typer.Option(
+            help="Generate a gradient preview PNG alongside the .cube file.",
+        ),
+    ] = True,
+) -> None:
+    """Generate a false color exposure LUT for a camera log profile."""
 
-    # ── Validate LUT size ─────────────────────────────────────────────
-    if lut_size < 2:
-        raise ValueError(f"--size must be at least 2, got {lut_size}")
-    if lut_size not in (17, 33, 65):
-        print(f"  ⚠  Non-standard LUT size {lut_size}. Common NLE sizes are 17, 33, 65.")
+    # ── Validate inputs ───────────────────────────────────────────────
+    if profile not in PROFILES:
+        console.print(
+            f"[bold red]Error:[/bold red] Unknown profile [bold]'{profile}'[/bold]"
+        )
+        console.print(f"[dim]Valid options: {', '.join(PROFILES.keys())}[/dim]")
+        raise typer.Exit(1)
 
-    profile   = PROFILES[log_profile]
-    blend_log = blend_width_in_log(blend_width_stops, profile)  # approximate, for display
+    if size < 2:
+        console.print(
+            f"[bold red]Error:[/bold red] --size must be at least 2, got {size}"
+        )
+        raise typer.Exit(1)
 
-    print("=" * 58)
-    print("  False Color Exposure LUT Generator")
-    print("=" * 58)
-    print(f"\n  Profile       : {profile['name']}")
-    print(f"  Cameras       : {profile['cameras']}")
-    print(f"  Middle gray   : {profile['middle_gray']:.4f}  (log-encoded 18% gray)")
-    print(f"  Zones defined : {len(ZONES)}")
-    print(f"  Zone width    : ±{zone_half_width} stops")
-    print(f"  Blend width   : {blend_width_stops} stops  ({blend_log:.4f} log units, at mid-gray)")
-    print(f"  LUT size      : {lut_size}³  ({lut_size**3:,} entries)")
-    print(f"  Output file   : {filename}")
+    log_profile_obj = PROFILES[profile]
+    filename = (output or OUTPUT_FILENAME).replace("{profile}", profile)
+    blend_log = blend_width_in_log(blend, log_profile_obj)
 
-    # ── Blend ratio check ────────────────────────────────────────────────
-    # The blend ramp is applied symmetrically at each zone edge, so the
-    # ramp from each side eats into the zone core from both directions.
-    # When blend/half_width > ~0.33, the two ramps overlap in the middle
-    # and the zone core never reaches 100% opacity.
-    #
-    # Concretely: a zone spans  [center - half_width, center + half_width].
-    # The color is fully solid only between:
-    #   (center - half_width + blend_width)  and  (center + half_width - blend_width)
-    # That solid core is  2 * (half_width - blend_width)  stops wide.
-    # If blend_width >= half_width the core shrinks to zero — no solid color at all.
-    blend_ratio      = blend_width_stops / zone_half_width
-    solid_core_stops = 2.0 * (zone_half_width - blend_width_stops)
+    # ── Header ────────────────────────────────────────────────────────
+    console.print()
+    console.print(Rule("[bold]False Color Exposure LUT Generator[/bold]", style="dim"))
+    console.print()
+    console.print(f"  [dim]Profile   :[/dim]  {log_profile_obj['name']}")
+    console.print(f"  [dim]Cameras   :[/dim]  [dim]{log_profile_obj['cameras']}[/dim]")
+    console.print(
+        f"  [dim]Mid gray  :[/dim]  {log_profile_obj['middle_gray']:.4f}  [dim](log-encoded 18% gray)[/dim]"
+    )
+    console.print(f"  [dim]Zones     :[/dim]  {len(ZONES)}")
+    console.print(f"  [dim]Zone width:[/dim]  ±{half_width} stops")
+    console.print(
+        f"  [dim]Blend     :[/dim]  {blend} stops  [dim]({blend_log:.4f} log units at mid-gray)[/dim]"
+    )
+    console.print(
+        f"  [dim]LUT size  :[/dim]  {size}³  [dim]({size**3:,} entries)[/dim]"
+    )
+    console.print(f"  [dim]Output    :[/dim]  {filename}")
+
+    if size not in (17, 33, 65):
+        console.print(
+            f"\n  [yellow]⚠[/yellow]  Non-standard LUT size {size}. Common NLE sizes are 17, 33, 65."
+        )
+
+    # ── Blend ratio analysis ──────────────────────────────────────────
+    blend_ratio = blend / half_width
+    solid_core_stops = 2.0 * (half_width - blend)
 
     if blend_ratio > 0.50:
-        ratio_label = "⚠️  POOR   — zones never reach solid color (cores overlap)"
+        ratio_label = (
+            "[red]POOR[/red]   — zones never reach solid color (cores overlap)"
+        )
     elif blend_ratio > 0.40:
-        ratio_label = "⚠️  SOFT   — cores barely solid, blending dominates"
+        ratio_label = "[yellow]SOFT[/yellow]   — cores barely solid, blending dominates"
     elif blend_ratio > 0.33:
-        ratio_label = "〜  OK     — usable but softer than ideal"
+        ratio_label = "[dim]OK[/dim]     — usable but softer than ideal"
     elif blend_ratio >= 0.15:
-        ratio_label = "✓  GOOD   — solid core with smooth edges"
+        ratio_label = "[green]GOOD[/green]   — solid core with smooth edges"
     else:
-        ratio_label = "〜  SHARP  — hard edges, clinical look"
+        ratio_label = "[dim]SHARP[/dim]  — hard edges, clinical look"
 
-    print(f"\n  Blend ratio   : {blend_ratio:.0%}  ({ratio_label})")
-    print(f"  Solid core    : {solid_core_stops:.3f} stops per zone"
-          f"  (zone is {zone_half_width*2:.2f} stops wide,"
-          f" {blend_ratio*100:.0f}% consumed by fade ramps)")
+    console.print(f"\n  [dim]Blend ratio:[/dim]  {blend_ratio:.0%}  {ratio_label}")
+    console.print(
+        f"  [dim]Solid core:[/dim]   {solid_core_stops:.3f} stops  "
+        f"[dim](zone is {half_width * 2:.2f} stops wide, "
+        f"{blend_ratio * 100:.0f}% consumed by fade ramps)[/dim]"
+    )
     if blend_ratio > 0.40:
-        print(f"\n  ⚠  Consider reducing --blend to"
-              f" {zone_half_width * 0.27:.2f}"
-              f" (27% of half_width = solid-core sweet spot)")
-    # ─────────────────────────────────────────────────────────────────────
+        console.print(
+            f"\n  [yellow]⚠[/yellow]  Consider reducing [bold]--blend[/bold] to "
+            f"[bold]{half_width * 0.27:.2f}[/bold] "
+            f"[dim](27% of half-width = solid-core sweet spot)[/dim]"
+        )
 
-    parsed_zones = build_zones(ZONES, profile, zone_half_width, blend_width_stops)
+    # ── Zone preview table ────────────────────────────────────────────
+    console.print()
+    parsed_zones = build_zones(ZONES, log_profile_obj, half_width, blend)
     check_zone_overlaps(parsed_zones)
-    print_zone_preview(ZONES, parsed_zones)
+    print_zone_table(ZONES, parsed_zones, log_profile_obj)
 
+    # ── Build and write ───────────────────────────────────────────────
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
 
-    lut_data = build_lut(parsed_zones, lut_size)
-    write_cube(lut_data, lut_size, filename, profile, ZONES, parsed_zones)
+    lut_data = build_lut(parsed_zones, size, log_profile_obj)
+    write_cube(lut_data, size, filename, log_profile_obj, ZONES, parsed_zones)
 
+    if preview:
+        preview_path = os.path.splitext(filename)[0] + "_preview.png"
+        generate_gradient_preview(parsed_zones, log_profile_obj, preview_path)
+
+    # ── Footer ────────────────────────────────────────────────────────
     size_kb = os.path.getsize(filename) / 1024
-    print(f"\n✅ Done!  {size_kb:.1f} KB")
-    print(f"   Drop '{filename}' into DaVinci Resolve,")
-    print(f"   Premiere Pro, FCPX, or your camera's LUT slot.")
-    print("=" * 58)
+    console.print()
+    console.print(
+        f"[bold green]✅ Done![/bold green]  [bold]{filename}[/bold]  [dim]({size_kb:.1f} KB)[/dim]"
+    )
+    console.print(
+        "   Drop it into [bold]DaVinci Resolve[/bold], [bold]Premiere Pro[/bold], "
+        "[bold]FCPX[/bold], or your camera's LUT slot."
+    )
+    console.print(Rule(style="dim"))
+    console.print()
 
 
 if __name__ == "__main__":
-    main()
+    app()
