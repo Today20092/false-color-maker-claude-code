@@ -28,9 +28,17 @@ Dependencies:
 import os
 from typing import Annotated, Optional
 
+import warnings
+
 import colour
 import numpy as np
 import typer
+
+# colour-science's CanonLog2 v1.2 formula evaluates a branch for negative inputs
+# as part of a vectorised where()-style implementation; the branch is never
+# reached for valid scene-linear values but triggers a numpy RuntimeWarning.
+warnings.filterwarnings("ignore", message="invalid value encountered in log10",
+                        category=RuntimeWarning, module="colour")
 from PIL import Image
 from rich import box
 from rich.console import Console
@@ -130,12 +138,12 @@ console = Console()
 
 def _logc3_encode(x):
     """ARRI LogC3 encode at EI800 — wrapper to lock in the exposure index."""
-    return colour.models.log_encoding_LogC3(x, exposure_index=800)
+    return colour.models.log_encoding_ARRILogC3(x, EI=800)
 
 
 def _logc3_decode(x):
     """ARRI LogC3 decode at EI800 — wrapper to lock in the exposure index."""
-    return colour.models.log_decoding_LogC3(x, exposure_index=800)
+    return colour.models.log_decoding_ARRILogC3(x, EI=800)
 
 
 PROFILES = {
@@ -171,36 +179,36 @@ PROFILES = {
         "cameras": "C70, C300 III, C500 II, EOS R5 C, EOS C70",
         "linear_to_log": colour.models.log_encoding_CanonLog2,
         "log_to_linear": colour.models.log_decoding_CanonLog2,
-        "middle_gray": 0.4175,
+        "middle_gray": 0.3983,  # colour-science: log_encoding_CanonLog2(0.18)
         "white_clip": (0.70, 1.00),
-        "black_clip": (0.00, 0.08),  # nominal black at ~0.0731
+        "black_clip": (0.00, 0.10),  # nominal black at ~0.0939 per colour-science
     },
     "flog2": {
         "name": "Fuji F-Log2",
         "cameras": "X-H2S, X-H2, GFX100S II",
         "linear_to_log": colour.models.log_encoding_FLog2,
         "log_to_linear": colour.models.log_decoding_FLog2,
-        "middle_gray": 0.3185,
+        "middle_gray": 0.3910,  # colour-science: log_encoding_FLog2(0.18)
         "white_clip": (0.60, 1.00),
-        "black_clip": (0.00, 0.10),  # nominal black at ~0.0929
+        "black_clip": (0.00, 0.10),  # nominal black at ~0.0937 per colour-science
     },
     "nlog": {
         "name": "Nikon N-Log",
         "cameras": "Z6, Z7, Z6II, Z7II, Z8, Z9",
         "linear_to_log": colour.models.log_encoding_NLog,
         "log_to_linear": colour.models.log_decoding_NLog,
-        "middle_gray": 0.3635,
+        "middle_gray": 0.3637,  # colour-science: log_encoding_NLog(0.18)
         "white_clip": (0.72, 1.00),
-        "black_clip": (0.00, 0.13),  # nominal black at ~0.124
+        "black_clip": (0.00, 0.13),  # nominal black at ~0.125 per colour-science
     },
     "bmpfilm5": {
         "name": "Blackmagic Film Gen 5",
         "cameras": "Pocket 6K G2, 6K Pro, 6K G2, URSA Mini Pro 12K",
         "linear_to_log": colour.models.oetf_BlackmagicFilmGeneration5,
         "log_to_linear": colour.models.oetf_inverse_BlackmagicFilmGeneration5,
-        "middle_gray": 0.3938,
+        "middle_gray": 0.3836,  # colour-science: oetf_BlackmagicFilmGeneration5(0.18)
         "white_clip": (0.75, 1.00),
-        "black_clip": (0.00, 0.10),  # nominal black at ~0.0925
+        "black_clip": (0.00, 0.10),  # nominal black at ~0.0933 per colour-science
     },
 }
 
