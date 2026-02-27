@@ -15,10 +15,13 @@ Supported profiles:
 
 Run with:
   uv run false_color_lut_generator.py
+  uv run false_color_lut_generator.py --profile slog3 --size 65
 """
 
 import math
 import os
+
+import numpy as np
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -109,7 +112,7 @@ OUTPUT_FILENAME = "luts/FalseColor_{profile}.cube"
 #    BMDFilm5 — Blackmagic Design Generation 5 Color Science SDK
 # ───────────────────────────────────────────────────────────────────────
 
-def _vlog_to_log(x):
+def _vlog_to_log(x: float) -> float:
     """Panasonic V-Log L. Covers ~14 stops dynamic range."""
     x = max(x, 1e-10)
     if x < 0.01:
@@ -117,7 +120,7 @@ def _vlog_to_log(x):
     return 0.241514 * math.log10(x + 0.00873) + 0.598206
 
 
-def _slog3_to_log(x):
+def _slog3_to_log(x: float) -> float:
     """Sony S-Log3. Covers ~15.3 stops dynamic range.
     Reference: Sony S-Log3 Technical Summary v1.0
     Legal range: 0% exposure = 95/1023 ≈ 0.0929, middle gray = 420/1023 ≈ 0.4106
@@ -130,7 +133,7 @@ def _slog3_to_log(x):
     return (x * (171.2102946929 - 95.0) / 0.01125 + 95.0) / 1023.0
 
 
-def _logc3_to_log(x):
+def _logc3_to_log(x: float) -> float:
     """ARRI LogC3 at EI800. Covers ~14 stops dynamic range."""
     x = max(x, 1e-10)
     if x >= 0.010591:
@@ -138,13 +141,13 @@ def _logc3_to_log(x):
     return 5.367655 * x + 0.092809
 
 
-def _clog2_to_log(x):
+def _clog2_to_log(x: float) -> float:
     """Canon C-Log2. Covers ~15+ stops dynamic range."""
     x = max(x, 1e-10)
     return 0.281863093 * math.log10(87.09937546 * x + 1.0) + 0.073059361
 
 
-def _flog2_to_log(x):
+def _flog2_to_log(x: float) -> float:
     """
     Fuji F-Log2. Covers ~14+ stops dynamic range.
     Reference: Fujifilm F-Log2 Specification v1.0
@@ -156,7 +159,7 @@ def _flog2_to_log(x):
     return 8.799461 * x + 0.092864
 
 
-def _nlog_to_log(x):
+def _nlog_to_log(x: float) -> float:
     """
     Nikon N-Log. Covers ~12 stops dynamic range.
     NOTE: This is an approximation derived from published middle-gray and
@@ -170,7 +173,7 @@ def _nlog_to_log(x):
     return 10.541 * x + 0.124
 
 
-def _bmpfilm5_to_log(x):
+def _bmpfilm5_to_log(x: float) -> float:
     """
     Blackmagic Film Gen 5. Covers ~13 stops dynamic range.
     Reference: Blackmagic Design Generation 5 Color Science SDK.
@@ -180,6 +183,34 @@ def _bmpfilm5_to_log(x):
     if x < cut:
         return 8.283605932402494 * x + 0.09246575342465753
     return 0.08692876065491224 * math.log(x + 0.005494072432257808) + 0.5402385771788551
+
+
+# ── Transfer function self-tests ─────────────────────────────────────────
+# Verify that each profile's middle gray (0.18 linear) maps to its published
+# reference log value. Any mismatch > 0.002 log units raises an error at import.
+
+def _validate_transfer_functions() -> None:
+    """Sanity-check each profile's transfer function against published reference points."""
+    tol = 0.002
+    checks = [
+        ("V-Log L",        _vlog_to_log,     0.18, 0.4233),
+        ("S-Log3",         _slog3_to_log,    0.18, 0.4106),
+        ("LogC3 EI800",    _logc3_to_log,    0.18, 0.3910),
+        ("C-Log2",         _clog2_to_log,    0.18, 0.4175),
+        ("F-Log2",         _flog2_to_log,    0.18, 0.3185),
+        ("N-Log [approx]", _nlog_to_log,     0.18, 0.3635),
+        ("BMD Film Gen 5", _bmpfilm5_to_log, 0.18, 0.3938),
+    ]
+    for name, fn, linear_in, expected in checks:
+        actual = fn(linear_in)
+        if abs(actual - expected) > tol:
+            raise AssertionError(
+                f"Transfer function mismatch for {name}: "
+                f"expected {expected:.4f}, got {actual:.4f} "
+                f"(diff {abs(actual - expected):.4f} > tol {tol})"
+            )
+
+_validate_transfer_functions()
 
 
 # ── Profile registry ────────────────────────────────────────────────────
@@ -256,7 +287,7 @@ PROFILES = {
 
 MIDDLE_GRAY_LINEAR = 0.18  # Scene-linear value of 18% gray (industry standard)
 
-def stop_to_log(stops, profile):
+def stop_to_log(stops: float, profile: dict) -> float:
     """
     Convert a stop offset (relative to middle gray) to a log-encoded value.
     Each stop doubles or halves the linear light level:
@@ -267,7 +298,7 @@ def stop_to_log(stops, profile):
     return profile["linear_to_log"](linear)
 
 
-def stop_to_log_range(stops, half_width_stops, profile):
+def stop_to_log_range(stops: float, half_width_stops: float, profile: dict) -> tuple[float, float]:
     """
     Return (lo, hi) log boundaries for a zone centered at 'stops',
     spanning ±half_width_stops on either side.
@@ -277,13 +308,14 @@ def stop_to_log_range(stops, half_width_stops, profile):
     return lo, hi
 
 
-def blend_width_in_log(blend_width_stops, profile):
+def blend_width_in_log(blend_width_stops: float, profile: dict) -> float:
     """
-    Convert a stop-based blend width to log units by measuring
-    how wide one stop is in log space at middle gray.
+    Approximate blend width in log units, measured at middle gray.
+    Used for informational display only; per-zone blend widths are
+    computed more accurately in build_zones().
     """
-    center       = stop_to_log(0, profile)
-    one_stop_up  = stop_to_log(blend_width_stops, profile)
+    center      = stop_to_log(0, profile)
+    one_stop_up = stop_to_log(blend_width_stops, profile)
     return abs(one_stop_up - center)
 
 
@@ -291,7 +323,7 @@ def blend_width_in_log(blend_width_stops, profile):
 #  ZONE BUILDER
 # ───────────────────────────────────────────────────────────────────────
 
-def hex_to_rgb(hex_color):
+def hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
     """Convert '#FF0000' or 'FF0000' to normalized (r, g, b) floats 0.0–1.0."""
     hex_color = hex_color.strip().lstrip("#")
     if len(hex_color) != 6:
@@ -305,10 +337,20 @@ def hex_to_rgb(hex_color):
     )
 
 
-def build_zones(zones_config, profile, half_width_stops):
+def build_zones(
+    zones_config: list,
+    profile: dict,
+    half_width_stops: float,
+    blend_width_stops: float,
+) -> list:
     """
     Resolve each entry in the user's ZONES list into a
-    (lo, hi, r, g, b) tuple with log-domain boundaries.
+    (lo, hi, r, g, b, bw) tuple with log-domain boundaries.
+
+    The blend width (bw) is computed at each zone's own center stop so
+    that feathering is accurate across the non-linear log curve — not just
+    approximate at middle gray.  Clip zones fall back to a middle-gray
+    approximation since they have no defined stop center.
     """
     parsed = []
     for stop_val, hex_color in zones_config:
@@ -316,26 +358,53 @@ def build_zones(zones_config, profile, half_width_stops):
 
         if stop_val == "white_clip":
             lo, hi = profile["white_clip"]
+            center_stop = None
         elif stop_val == "black_clip":
             lo, hi = profile["black_clip"]
+            center_stop = None
         elif isinstance(stop_val, (int, float)):
             lo, hi = stop_to_log_range(stop_val, half_width_stops, profile)
+            center_stop = float(stop_val)
         else:
             raise ValueError(
                 f"Unknown zone value '{stop_val}' — "
                 f"use a number, 'white_clip', or 'black_clip'"
             )
 
-        parsed.append((lo, hi, r, g, b))
+        # Compute blend width in log units at this zone's center stop.
+        # For clip zones, fall back to middle gray as an approximation.
+        if center_stop is not None:
+            c  = stop_to_log(center_stop, profile)
+            up = stop_to_log(center_stop + blend_width_stops, profile)
+        else:
+            c  = stop_to_log(0, profile)
+            up = stop_to_log(blend_width_stops, profile)
+        bw = abs(up - c)
+
+        parsed.append((lo, hi, r, g, b, bw))
 
     return parsed
+
+
+def check_zone_overlaps(parsed_zones: list) -> None:
+    """Print a warning for any zones whose log ranges overlap."""
+    sorted_z = sorted(parsed_zones, key=lambda z: z[0])
+    for i in range(len(sorted_z) - 1):
+        lo_a, hi_a = sorted_z[i][0], sorted_z[i][1]
+        lo_b, hi_b = sorted_z[i + 1][0], sorted_z[i + 1][1]
+        if hi_a > lo_b:
+            print(
+                f"  ⚠  Zone overlap: log {lo_a:.3f}–{hi_a:.3f} "
+                f"overlaps log {lo_b:.3f}–{hi_b:.3f} "
+                f"(shared range {lo_b:.3f}–{hi_a:.3f})"
+            )
 
 
 # ───────────────────────────────────────────────────────────────────────
 #  CORE FALSE COLOR MATH
 # ───────────────────────────────────────────────────────────────────────
 
-def rgb_luminance(r, g, b):
+def rgb_luminance(r: float, g: float, b: float) -> float:
     """
     Rec.709 perceptual luma. Combines R, G, B into a single brightness.
     Green is weighted most because human eyes are most sensitive to it.
@@ -343,13 +412,17 @@ def rgb_luminance(r, g, b):
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-def smoothstep(edge0, edge1, x):
+def smoothstep(edge0: float, edge1: float, x: float) -> float:
     """S-curve interpolation: 0.0 at edge0, 1.0 at edge1, smooth in between."""
+    if edge0 == edge1:
+        return 1.0 if x >= edge1 else 0.0
     t = max(0.0, min(1.0, (x - edge0) / (edge1 - edge0)))
     return t * t * (3.0 - 2.0 * t)
 
 
-def apply_false_color(r, g, b, parsed_zones, blend_width):
+def apply_false_color(
+    r: float, g: float, b: float, parsed_zones: list
+) -> tuple[float, float, float]:
     """
     Given log-encoded R,G,B (0.0–1.0):
     - Calculate luma
@@ -360,9 +433,9 @@ def apply_false_color(r, g, b, parsed_zones, blend_width):
     best_weight = 0.0
     best_color  = None
 
-    for (lo, hi, fr, fg, fb) in parsed_zones:
-        fade_in  = smoothstep(lo - blend_width, lo + blend_width, luma)
-        fade_out = 1.0 - smoothstep(hi - blend_width, hi + blend_width, luma)
+    for (lo, hi, fr, fg, fb, bw) in parsed_zones:
+        fade_in  = smoothstep(lo - bw, lo + bw, luma)
+        fade_out = 1.0 - smoothstep(hi - bw, hi + bw, luma)
         weight   = fade_in * fade_out
 
         if weight > best_weight:
@@ -384,30 +457,76 @@ def apply_false_color(r, g, b, parsed_zones, blend_width):
 #  LUT BUILDER AND WRITER
 # ───────────────────────────────────────────────────────────────────────
 
-def build_lut(parsed_zones, size, blend_width):
-    """Build the full size³ LUT table."""
-    lut  = []
-    step = 1.0 / (size - 1)
+def build_lut(parsed_zones: list, size: int) -> list[tuple[float, float, float]]:
+    """
+    Build the full size³ LUT table using NumPy vectorization.
+
+    Computes luminance and smoothstep blending across the entire 3D grid
+    simultaneously, which is ~10–100× faster than a pure-Python loop.
+
+    Output order matches the .cube format: B (outer) → G → R (inner).
+    """
     print(f"  Building {size}³ LUT ({size**3:,} entries)...")
 
-    for bi in range(size):
-        for gi in range(size):
-            for ri in range(size):
-                r_out, g_out, b_out = apply_false_color(
-                    ri * step, gi * step, bi * step,
-                    parsed_zones, blend_width
-                )
-                lut.append((
-                    max(0.0, min(1.0, r_out)),
-                    max(0.0, min(1.0, g_out)),
-                    max(0.0, min(1.0, b_out)),
-                ))
+    vals = np.linspace(0.0, 1.0, size)
 
+    # Shape: (size, size, size) indexed as [ri, gi, bi]
+    R, G, B = np.meshgrid(vals, vals, vals, indexing="ij")
+
+    # Rec.709 luminance over the full grid
+    luma = 0.2126 * R + 0.7152 * G + 0.0722 * B
+
+    # Start with grayscale passthrough; overwrite where zones match
+    out_r = luma.copy()
+    out_g = luma.copy()
+    out_b = luma.copy()
+    best_weight = np.zeros_like(luma)
+
+    for (lo, hi, fr, fg, fb, bw) in parsed_zones:
+        if bw == 0.0:
+            fade_in  = np.where(luma >= lo, 1.0, 0.0)
+            fade_out = np.where(luma <  hi, 1.0, 0.0)
+        else:
+            t_in    = np.clip((luma - (lo - bw)) / (2.0 * bw), 0.0, 1.0)
+            fade_in = t_in * t_in * (3.0 - 2.0 * t_in)
+            t_out    = np.clip((luma - (hi - bw)) / (2.0 * bw), 0.0, 1.0)
+            fade_out = 1.0 - t_out * t_out * (3.0 - 2.0 * t_out)
+
+        weight  = fade_in * fade_out
+        mask    = weight > best_weight
+
+        mixed_r = fr * weight + luma * (1.0 - weight)
+        mixed_g = fg * weight + luma * (1.0 - weight)
+        mixed_b = fb * weight + luma * (1.0 - weight)
+
+        best_weight = np.where(mask, weight, best_weight)
+        out_r       = np.where(mask, mixed_r, out_r)
+        out_g       = np.where(mask, mixed_g, out_g)
+        out_b       = np.where(mask, mixed_b, out_b)
+
+    out_r = np.clip(out_r, 0.0, 1.0)
+    out_g = np.clip(out_g, 0.0, 1.0)
+    out_b = np.clip(out_b, 0.0, 1.0)
+
+    # Reorder to .cube iteration: B (outer) → G → R (inner).
+    # Arrays are indexed [ri, gi, bi]; transpose(2,1,0) → [bi, gi, ri] then ravel.
+    flat_r = out_r.transpose(2, 1, 0).ravel()
+    flat_g = out_g.transpose(2, 1, 0).ravel()
+    flat_b = out_b.transpose(2, 1, 0).ravel()
+
+    lut = list(zip(flat_r.tolist(), flat_g.tolist(), flat_b.tolist()))
     print(f"  ✓ {len(lut):,} entries generated.")
     return lut
 
 
-def write_cube(lut, size, filename, profile, zones_config, parsed_zones):
+def write_cube(
+    lut: list,
+    size: int,
+    filename: str,
+    profile: dict,
+    zones_config: list,
+    parsed_zones: list,
+) -> None:
     """Write the LUT table to a .cube file with a descriptive header."""
     zone_lines = []
     for (stop_val, hex_col), (lo, hi, *_) in zip(zones_config, parsed_zones):
@@ -422,7 +541,7 @@ def write_cube(lut, size, filename, profile, zones_config, parsed_zones):
         f"# False Color Exposure Monitor LUT\n"
         f"# Profile  : {profile['name']}\n"
         f"# Cameras  : {profile['cameras']}\n"
-        f"# Generator: false_color_generator.py\n"
+        f"# Generator: false_color_lut_generator.py\n"
         f"#\n"
         f"# Zone Reference:\n"
         + "\n".join(zone_lines) +
@@ -446,32 +565,31 @@ def write_cube(lut, size, filename, profile, zones_config, parsed_zones):
 #  ZONE PREVIEW PRINTOUT
 # ───────────────────────────────────────────────────────────────────────
 
-def print_zone_preview(zones_config, parsed_zones, blend_width):
+def print_zone_preview(zones_config: list, parsed_zones: list) -> None:
     print(f"\n  {'Zone':<16} {'Log Range':<18} {'Target':<10} {'Output':<10} Match")
     print(f"  {'────':<16} {'─────────':<18} {'──────':<10} {'──────':<10} ─────")
 
-    for (stop_val, hex_col), (lo, hi, fr, fg, fb) in zip(zones_config, parsed_zones):
+    for (stop_val, hex_col), (lo, hi, fr, fg, fb, bw) in zip(zones_config, parsed_zones):
         label = (
             "white_clip" if stop_val == "white_clip" else
             "black_clip" if stop_val == "black_clip" else
             f"{stop_val:+.0f} stops"
         )
         center = (lo + hi) / 2.0
-        r_out, g_out, b_out = apply_false_color(
-            center, center, center, parsed_zones, blend_width
-        )
+        r_out, g_out, b_out = apply_false_color(center, center, center, parsed_zones)
         hex_out = "#{:02X}{:02X}{:02X}".format(
             int(r_out * 255), int(g_out * 255), int(b_out * 255)
         )
         match = "✓" if hex_out.upper() == hex_col.upper() else "~"
         print(f"  {label:<16} {lo:.3f} - {hi:.3f}    {hex_col:<10} {hex_out:<10} {match}")
 
-    # Sample a between-zone point (should always be gray)
+    # Sample a between-zone point (should always be gray).
+    # Sort by lo so the gap midpoint is always between the two lowest zones,
+    # regardless of the order zones were defined in CONFIG.
     if len(parsed_zones) >= 2:
-        gap_mid = (parsed_zones[0][1] + parsed_zones[1][0]) / 2.0
-        r_out, g_out, b_out = apply_false_color(
-            gap_mid, gap_mid, gap_mid, parsed_zones, blend_width
-        )
+        sorted_z = sorted(parsed_zones, key=lambda z: z[0])
+        gap_mid  = (sorted_z[0][1] + sorted_z[1][0]) / 2.0
+        r_out, g_out, b_out = apply_false_color(gap_mid, gap_mid, gap_mid, parsed_zones)
         hex_out = "#{:02X}{:02X}{:02X}".format(
             int(r_out * 255), int(g_out * 255), int(b_out * 255)
         )
@@ -484,19 +602,50 @@ def print_zone_preview(zones_config, parsed_zones, blend_width):
 #  MAIN
 # ───────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the False Color LUT generator."""
+    import argparse
 
-    # Validate profile
-    if LOG_PROFILE not in PROFILES:
-        available = "  |  ".join(PROFILES.keys())
-        raise ValueError(
-            f"\nUnknown profile '{LOG_PROFILE}'.\n"
-            f"Available options:  {available}\n"
-        )
+    parser = argparse.ArgumentParser(
+        description="Generate a false color exposure LUT for a camera log profile.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--profile", default=LOG_PROFILE, choices=list(PROFILES.keys()),
+        help="Camera log profile",
+    )
+    parser.add_argument(
+        "--size", type=int, default=LUT_SIZE, metavar="N",
+        help="LUT grid size (standard NLE values: 17, 33, 65)",
+    )
+    parser.add_argument(
+        "--half-width", type=float, default=ZONE_HALF_WIDTH_STOPS, metavar="STOPS",
+        help="Zone half-width in stops (±stops from zone center)",
+    )
+    parser.add_argument(
+        "--blend", type=float, default=BLEND_WIDTH_STOPS, metavar="STOPS",
+        help="Feathering width at zone edges in stops",
+    )
+    parser.add_argument(
+        "--output", default=None, metavar="FILE",
+        help="Output .cube filename (default: luts/FalseColor_{profile}.cube)",
+    )
+    args = parser.parse_args()
 
-    profile    = PROFILES[LOG_PROFILE]
-    filename   = OUTPUT_FILENAME.replace("{profile}", LOG_PROFILE)
-    blend_log  = blend_width_in_log(BLEND_WIDTH_STOPS, profile)
+    log_profile       = args.profile
+    lut_size          = args.size
+    zone_half_width   = args.half_width
+    blend_width_stops = args.blend
+    filename          = (args.output or OUTPUT_FILENAME).replace("{profile}", log_profile)
+
+    # ── Validate LUT size ─────────────────────────────────────────────
+    if lut_size < 2:
+        raise ValueError(f"--size must be at least 2, got {lut_size}")
+    if lut_size not in (17, 33, 65):
+        print(f"  ⚠  Non-standard LUT size {lut_size}. Common NLE sizes are 17, 33, 65.")
+
+    profile   = PROFILES[log_profile]
+    blend_log = blend_width_in_log(blend_width_stops, profile)  # approximate, for display
 
     print("=" * 58)
     print("  False Color Exposure LUT Generator")
@@ -505,9 +654,9 @@ if __name__ == "__main__":
     print(f"  Cameras       : {profile['cameras']}")
     print(f"  Middle gray   : {profile['middle_gray']:.4f}  (log-encoded 18% gray)")
     print(f"  Zones defined : {len(ZONES)}")
-    print(f"  Zone width    : ±{ZONE_HALF_WIDTH_STOPS} stops")
-    print(f"  Blend width   : {BLEND_WIDTH_STOPS} stops  ({blend_log:.4f} log units)")
-    print(f"  LUT size      : {LUT_SIZE}³  ({LUT_SIZE**3:,} entries)")
+    print(f"  Zone width    : ±{zone_half_width} stops")
+    print(f"  Blend width   : {blend_width_stops} stops  ({blend_log:.4f} log units, at mid-gray)")
+    print(f"  LUT size      : {lut_size}³  ({lut_size**3:,} entries)")
     print(f"  Output file   : {filename}")
 
     # ── Blend ratio check ────────────────────────────────────────────────
@@ -521,8 +670,8 @@ if __name__ == "__main__":
     #   (center - half_width + blend_width)  and  (center + half_width - blend_width)
     # That solid core is  2 * (half_width - blend_width)  stops wide.
     # If blend_width >= half_width the core shrinks to zero — no solid color at all.
-    blend_ratio     = BLEND_WIDTH_STOPS / ZONE_HALF_WIDTH_STOPS
-    solid_core_stops = 2.0 * (ZONE_HALF_WIDTH_STOPS - BLEND_WIDTH_STOPS)
+    blend_ratio      = blend_width_stops / zone_half_width
+    solid_core_stops = 2.0 * (zone_half_width - blend_width_stops)
 
     if blend_ratio > 0.50:
         ratio_label = "⚠️  POOR   — zones never reach solid color (cores overlap)"
@@ -537,23 +686,31 @@ if __name__ == "__main__":
 
     print(f"\n  Blend ratio   : {blend_ratio:.0%}  ({ratio_label})")
     print(f"  Solid core    : {solid_core_stops:.3f} stops per zone"
-          f"  (zone is {ZONE_HALF_WIDTH_STOPS*2:.2f} stops wide,"
+          f"  (zone is {zone_half_width*2:.2f} stops wide,"
           f" {blend_ratio*100:.0f}% consumed by fade ramps)")
     if blend_ratio > 0.40:
-        print(f"\n  ⚠  Consider reducing BLEND_WIDTH_STOPS to"
-              f" {ZONE_HALF_WIDTH_STOPS * 0.27:.2f}"
+        print(f"\n  ⚠  Consider reducing --blend to"
+              f" {zone_half_width * 0.27:.2f}"
               f" (27% of half_width = solid-core sweet spot)")
     # ─────────────────────────────────────────────────────────────────────
 
-    parsed_zones = build_zones(ZONES, profile, ZONE_HALF_WIDTH_STOPS)
-    print_zone_preview(ZONES, parsed_zones, blend_log)
+    parsed_zones = build_zones(ZONES, profile, zone_half_width, blend_width_stops)
+    check_zone_overlaps(parsed_zones)
+    print_zone_preview(ZONES, parsed_zones)
 
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    lut_data = build_lut(parsed_zones, LUT_SIZE, blend_log)
-    write_cube(lut_data, LUT_SIZE, filename, profile, ZONES, parsed_zones)
+    dirname = os.path.dirname(filename)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+
+    lut_data = build_lut(parsed_zones, lut_size)
+    write_cube(lut_data, lut_size, filename, profile, ZONES, parsed_zones)
 
     size_kb = os.path.getsize(filename) / 1024
     print(f"\n✅ Done!  {size_kb:.1f} KB")
     print(f"   Drop '{filename}' into DaVinci Resolve,")
     print(f"   Premiere Pro, FCPX, or your camera's LUT slot.")
     print("=" * 58)
+
+
+if __name__ == "__main__":
+    main()
